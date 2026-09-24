@@ -1,0 +1,18 @@
+# GK2Trainer · 发布包排除规则
+# 发布包只含：src（源码） / dist（成品） / assets（图标与截图） / tools（构建与自检脚本） / README.md / LICENSE
+
+# 构建与 IDE 残留
+*.pdb
+*.user
+*.suo
+.vs/
+Thumbs.db
+desktop.ini
+
+# Python / 脚本字节码
+__pycache__/
+*.pyc
+
+# 本地临时输出
+*.log
+_*.txt

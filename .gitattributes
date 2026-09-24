@@ -1,0 +1,6 @@
+# 换行与二进制策略（Windows 桌面项目）
+* text=auto eol=crlf
+*.exe binary
+*.ico binary
+*.png binary
+*.md  text eol=lf
