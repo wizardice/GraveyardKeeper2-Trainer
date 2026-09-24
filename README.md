@@ -10,6 +10,7 @@
 
 > ### ⬇️ [**下载最新版 GK2Trainer.exe**](https://github.com/wizardice/GraveyardKeeper2-Trainer/releases/latest/download/GK2Trainer.exe)
 > 单文件、免安装。也可以到 [Releases 页面](https://github.com/wizardice/GraveyardKeeper2-Trainer/releases/latest) 查看更新说明。
+
 ![修改器界面](assets/screenshot_main.png)
 
 | | |
