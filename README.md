@@ -3,6 +3,13 @@
 **为《守墓人 2》（Graveyard Keeper 2）正式版做的单机修改器。**
 免安装、免联网、不改动游戏文件 —— 一个 88 KB 的单文件 exe，双击就能用。
 
+[![最新版本](https://img.shields.io/github/v/release/wizardice/GraveyardKeeper2-Trainer?color=1A9FFF&label=%E7%89%88%E6%9C%AC)](https://github.com/wizardice/GraveyardKeeper2-Trainer/releases/latest)
+[![下载量](https://img.shields.io/github/downloads/wizardice/GraveyardKeeper2-Trainer/total?color=1A9FFF&label=%E4%B8%8B%E8%BD%BD)](https://github.com/wizardice/GraveyardKeeper2-Trainer/releases)
+[![许可](https://img.shields.io/github/license/wizardice/GraveyardKeeper2-Trainer?color=1A9FFF&label=%E8%AE%B8%E5%8F%AF)](LICENSE)
+[![平台](https://img.shields.io/badge/Windows-10%2B-1A9FFF)](#五兼容性)
+
+> ### ⬇️ [**下载最新版 GK2Trainer.exe**](https://github.com/wizardice/GraveyardKeeper2-Trainer/releases/latest/download/GK2Trainer.exe)
+> 单文件、免安装。也可以到 [Releases 页面](https://github.com/wizardice/GraveyardKeeper2-Trainer/releases/latest) 查看更新说明。
 ![修改器界面](assets/screenshot_main.png)
 
 | | |
