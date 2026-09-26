@@ -127,17 +127,31 @@ namespace GK2Trainer
         // 堆区间索引（快路径 + 精确二分）
         // ------------------------------------------------------------------
 
+        /// <summary>
+        /// 【审核轮 2026-09-26 · F6】Mono 堆区域判据（唯一权威版本）：
+        /// 已提交、非 Guard / NoAccess、私有内存、≥ 4 KB。
+        /// BuildHeapIndex 与 HeapRegions 共用，避免筛选条件漂移
+        /// （原两处逐字重复的注释自称「避免漂移」却已各自一份 —— 此即证据）。
+        /// ⚠ 刻意与 ProcessMemory.FilterScanRegions（引用扫描的宽松版）保持不同：
+        ///   后者无 MEM_PRIVATE / 尺寸下限，属 HANDOFF §1.3-2 方案B 既有裁决，勿合并。
+        /// </summary>
+        private static bool IsMonoHeapRegion(MemRegion r)
+        {
+            if (r.State != ProcessMemory.MEM_COMMIT) return false;
+            if ((r.Protect & ProcessMemory.PAGE_GUARD) != 0) return false;
+            if ((r.Protect & ProcessMemory.PAGE_NOACCESS) != 0) return false;
+            if (r.Type != ProcessMemory.MEM_PRIVATE) return false;
+            if (r.Size < 0x1000) return false;
+            return true;
+        }
+
         private void BuildHeapIndex()
         {
             List<MemRegion> regs = _mem.GetRegions();
             List<MemRegion> keep = new List<MemRegion>();
             foreach (MemRegion r in regs)
             {
-                if (r.State != ProcessMemory.MEM_COMMIT) continue;
-                if ((r.Protect & ProcessMemory.PAGE_GUARD) != 0) continue;
-                if ((r.Protect & ProcessMemory.PAGE_NOACCESS) != 0) continue;
-                if (r.Type != ProcessMemory.MEM_PRIVATE) continue;
-                if (r.Size < 0x1000) continue;
+                if (!IsMonoHeapRegion(r)) continue;
                 keep.Add(r);
             }
             keep.Sort(delegate(MemRegion a, MemRegion b) { return a.Base.CompareTo(b.Base); });
@@ -254,9 +268,42 @@ namespace GK2Trainer
         // Mono 元数据读取
         // ------------------------------------------------------------------
 
+        /// <summary>
+        /// 掩掉对象首字最低位（GC 标记位）。
+        ///
+        /// 【依据·实测】2026-09-26 现场取证（`02_分析记录\_星级与读档机制_20260926\
+        /// evidence\GC标记位污染vtable_实测取证_20260926.md`）：
+        /// 游戏的 Mono 运行时是 `mono-2.0-bdwgc.dll`（BDW / Boehm GC）。3,402 点采样中，
+        /// `*(PlayerData)` 读到的**最低位为 1 共 4 次，且全部落在判据失败点上**；同一份数据里
+        /// `slotRaw`（存的是对象**地址**）0 次为奇数。高频探针（~16 ms）抓到一段**连续 6 点、
+        /// 持续 78 ms** 的稳定窗口，期间该值**恒为同一个奇数**（同一对象、同一最低位翻转），
+        /// 且容器校验同步失败（污染沿容器链传播）。
+        /// 后果：vtable 解析失败 ⇒ 类名判定失败 ⇒ 结构判据误报 ⇒ 原判据清空重载（用户报告的
+        /// 「正常游玩中被识别为读档」）。污染窗口约 78 ms / 轮询 1 s ⇒ 单次过图撞上概率约 8%，
+        /// 解释了该 bug 的偶发性。
+        ///
+        /// 【安全性】托管对象指针按 8 字节对齐，最低 3 位恒为 0 ⇒ 掩掉最低位对**正常指针无损**，
+        /// 对被借用的标记位则正好还原真值。
+        /// ⚠ 「8 字节对齐」是**工程前提**（本仓库未引 Mono/BDW 源码作为依据），
+        /// 其**实测支持**为：t18 复算 7 份原始 CSV 共 114,726 个采样点，`slotRaw % 8 == 0` 为 **100.000%**。
+        /// 与机制推测一样，属「前提 + 实测支持」，不得写成已由源码证明。
+        ///
+        /// 【作用边界（t18 评审 F4，措辞纪律）】本掩码只消除**「对象首字被标记位污染」**这一个成因。
+        /// t17 独立验证还在同一场景观察到**另一种**误判形态：`pdVtRaw` 为**偶数**、
+        /// `pdClassOk=1` 而 **`containerOk=0`**（容器链上的子判据失败，见
+        /// `evidence/GC标记位污染vtable_实测取证_20260926.md` 的口径更正段）。
+        /// 该形态**不在本掩码覆盖范围内**，属另立跟踪项。
+        /// ⇒ **对外措辞统一为「消除了成因一」，不得写成「误判已彻底消除」。**
+        ///
+        /// 【机制说明】"标记位借用对象首字最低位"这一**具体实现属推测**（未查 Mono/BDW 源码确认）；
+        /// 但"最低位偶发置 1 且必然导致类名解析失败"是**实测确定**的，本掩码针对该现象，不依赖机制命名。
+        /// </summary>
+        public const long GC_MARK_BIT_MASK = ~1L;
+
         public string GetClassName(long vtable)
         {
             if (vtable == 0) return null;
+            vtable &= GC_MARK_BIT_MASK;          // 去掉 GC 借用的标记位（见上）
             string cached;
             bool hit;
             lock (_classGate) { hit = _classNameCache.TryGetValue(vtable, out cached); }
@@ -310,11 +357,7 @@ namespace GK2Trainer
             List<MemRegion> regs = _mem.GetRegions();
             foreach (MemRegion r in regs)
             {
-                if (r.State != ProcessMemory.MEM_COMMIT) continue;
-                if ((r.Protect & ProcessMemory.PAGE_GUARD) != 0) continue;
-                if ((r.Protect & ProcessMemory.PAGE_NOACCESS) != 0) continue;
-                if (r.Type != ProcessMemory.MEM_PRIVATE) continue;
-                if (r.Size < 0x1000) continue;
+                if (!IsMonoHeapRegion(r)) continue;
                 targets.Add(r);
             }
             return targets;
@@ -511,48 +554,50 @@ namespace GK2Trainer
             List<long>[] partAddr = new List<long>[n];
             List<long>[] partVt = new List<long>[n];
 
-            System.Threading.ThreadLocal<byte[]> tl =
-                new System.Threading.ThreadLocal<byte[]>(delegate { return new byte[CHUNK]; });
-
-            Parallel.For(0, n, delegate(int ri)
+            // 【P0-①】线程本地复用缓冲（原实现每 4 MB 分片都 new byte[]：
+            // 单次 FindAllAtoms 实测分配 4.84 GB、触发 Gen2 GC 28 次）。
+            // 【审核轮 2026-09-26】加 using：LOH 缓冲扫描结束立即归还，不再等完整 GC。
+            using (System.Threading.ThreadLocal<byte[]> tl =
+                new System.Threading.ThreadLocal<byte[]>(delegate { return new byte[CHUNK]; }))
             {
-                MemRegion r = targets[ri];
-                List<long> a = new List<long>();
-                List<long> v = new List<long>();
-                // 【P0-①】线程本地复用缓冲（原实现每 4 MB 分片都 new byte[]：
-                // 单次 FindAllAtoms 实测分配 4.84 GB、触发 Gen2 GC 28 次）
-                byte[] buf = tl.Value;
-                long off = 0;
-                while (off < r.Size)
+                Parallel.For(0, n, delegate(int ri)
                 {
-                    int want = (int)Math.Min((long)CHUNK, r.Size - off);
-                    if (want < ATOM_SIZE) break;
-                    int got = _mem.ReadInto(r.Base + off, buf, want);
-                    if (got > ATOM_SIZE)
+                    MemRegion r = targets[ri];
+                    List<long> a = new List<long>();
+                    List<long> v = new List<long>();
+                    byte[] buf = tl.Value;
+                    long off = 0;
+                    while (off < r.Size)
                     {
-                        int limit = got - ATOM_SIZE;
-                        for (int i = 0; i <= limit; i += 8)
+                        int want = (int)Math.Min((long)CHUNK, r.Size - off);
+                        if (want < ATOM_SIZE) break;
+                        int got = _mem.ReadInto(r.Base + off, buf, want);
+                        if (got > ATOM_SIZE)
                         {
-                            long vt = BitConverter.ToInt64(buf, i + ATOM_VTABLE);
-                            if (!MaybeHeap(vt)) continue;
-                            long sync = BitConverter.ToInt64(buf, i + ATOM_SYNC);
-                            if (sync != 0) continue;
-                            long tp = BitConverter.ToInt64(buf, i + ATOM_TYPE);
-                            if (!MaybeHeap(tp)) continue;
-                            float val = BitConverter.ToSingle(buf, i + ATOM_VALUE);
-                            if (float.IsNaN(val) || float.IsInfinity(val)) continue;
-                            if (val > 1e12f || val < -1e12f) continue;
+                            int limit = got - ATOM_SIZE;
+                            for (int i = 0; i <= limit; i += 8)
+                            {
+                                long vt = BitConverter.ToInt64(buf, i + ATOM_VTABLE);
+                                if (!MaybeHeap(vt)) continue;
+                                long sync = BitConverter.ToInt64(buf, i + ATOM_SYNC);
+                                if (sync != 0) continue;
+                                long tp = BitConverter.ToInt64(buf, i + ATOM_TYPE);
+                                if (!MaybeHeap(tp)) continue;
+                                float val = BitConverter.ToSingle(buf, i + ATOM_VALUE);
+                                if (float.IsNaN(val) || float.IsInfinity(val)) continue;
+                                if (val > 1e12f || val < -1e12f) continue;
 
-                            a.Add(r.Base + off + i);
-                            v.Add(vt);
+                                a.Add(r.Base + off + i);
+                                v.Add(vt);
+                            }
                         }
+                        if (want < CHUNK) break;
+                        off += want - (off + want < r.Size ? OVERLAP : 0);
                     }
-                    if (want < CHUNK) break;
-                    off += want - (off + want < r.Size ? OVERLAP : 0);
-                }
-                partAddr[ri] = a;
-                partVt[ri] = v;
-            });
+                    partAddr[ri] = a;
+                    partVt[ri] = v;
+                });
+            }
 
             // 合并 + 统计 vtable 频次
             List<long> candAddr = new List<long>();
@@ -595,14 +640,17 @@ namespace GK2Trainer
                 string cn = GetClassName(sorted[i].Key);
                 if (checkedCount <= 25)
                 {
-                    Diagnostics.Add(string.Format("  vt=0x{0:X}  count={1}  class={2}",
+                    // 【审核轮 2026-09-26】改走 AddNote：此处已属三级兜底的后台线程路径，
+                    //   直接 Diagnostics.Add 会绕过 _diagGate 锁、也不守 32 条滚动上限。
+                    AddNote(string.Format("  vt=0x{0:X}  count={1}  class={2}",
                         sorted[i].Key, sorted[i].Value, cn == null ? "<null>" : cn));
                 }
                 if (cn == "GameResAtom") { finalVt = sorted[i].Key; break; }
             }
             StatVtablesChecked = checkedCount;
             GameResAtomVTable = finalVt;
-            Diagnostics.Add(string.Format("候选={0} 不同vtable={1} 已检查={2} 命中=0x{3:X}",
+            // 【审核轮 2026-09-26】同上：改走 AddNote（并发纪律）。
+            AddNote(string.Format("候选={0} 不同vtable={1} 已检查={2} 命中=0x{3:X}",
                 StatCandidates, StatDistinctVtables, checkedCount, finalVt));
 
             // 精确重建
@@ -635,6 +683,44 @@ namespace GK2Trainer
 
         public const int ITEMDEF_ID = 0x10;
         private const int ITEMDEF_SYNC = 0x08;
+        /// <summary>
+        /// ItemDef 的 redSkulls / whiteSkulls 的**运行时**偏移。
+        /// 【来源·实测】2026-09-26 用 `Probe-ItemDefFields.exe` dump 814 个实例的 36 个字段槽，
+        /// 再用已知静态属性表反向匹配 ⇒ 这两个位置 **814/814 = 100% 吻合**（次优候选仅 94.8%），
+        /// 且两者是相邻的 4 字节 int（+0xF4 占 4 字节后紧接 +0xF8），与字段声明顺序互相印证。
+        /// 详见 `02_分析记录\_星级与读档机制_20260926\evidence\标定_ItemDef骷髅字段偏移.md`。
+        /// ⚠ 不要按 id 段推断属性：`guts_2_2:2` 的 id 写 `_2_2`，字段实为**红1白1**（814 条中唯一反例），
+        /// 该物品在标定样本内且于新偏移上吻合 ⇒ 证明取值来自字段。
+        ///
+        /// ⚠ **写入约束（t21 评审 H3）**：这两个字段都是 **4 字节 int**，若将来（如「物品种类修改」）
+        /// 需要写入，**只能写 4 字节**；按 8 字节写会覆盖 `+0xF8` 起的相邻字段（两者首尾相接）。
+        /// 当前全仓对这两个偏移**只有读取**（`ReadInt`），无任何写入点。
+        /// </summary>
+        public const int ITEMDEF_RED_SKULLS = 0xF4;
+        public const int ITEMDEF_WHITE_SKULLS = 0xF8;
+
+        /// <summary>
+        /// ItemDef 的 `quality` / `qualityType` 的**运行时**偏移（2026-09-26 同法标定，
+        /// 复用同一份 dump、改用 `tools/match_quality_fields.py` 反向匹配）：
+        /// **`quality` @ +0xD8、`qualityType` @ +0xDC**（同一 8 字节槽的高低位），
+        /// 两者 **814/814 = 100% 吻合**，次优候选仅 81.3%。详见标定文档 §4.1。
+        /// `qualityType`：0 = None（非星级物品，全库 645 条，二级菜单应置灰）、1 = Star（星级物品，169 条）。
+        /// ⚠ 同为 4 字节 int，写入约束与 red/white 相同（只可写 4 字节）。
+        /// </summary>
+        public const int ITEMDEF_QUALITY = 0xD8;
+        public const int ITEMDEF_QUALITY_TYPE = 0xDC;
+
+        /// <summary>
+        /// ItemDef 的 `type`（`ItemType` 枚举，4 字节 int）的**运行时**偏移：**@ +0xCC**
+        /// （即 0xC8 槽的**高 32 位**）。
+        /// 【2026-09-26 标定】同法反向匹配：**814/814 = 100% 吻合**，次优候选仅 74.2%
+        /// （`tools\match_type_field.py`，枚举数值取自反编译源码 `public enum ItemType`）。
+        /// 用途：「物品种类修改」的分组键 = **中文名 + ItemType**（用户 2026-09-26 确认）——
+        /// ItemType 是区分「外科医生的失误」6 条（Bones/Brain/Guts/Heart/Skin/Skull，
+        /// 其余字段完全相同、红白均为 -1）的**唯一**手段。
+        /// ⚠ 同为 4 字节，只可写 4 字节。
+        /// </summary>
+        public const int ITEMDEF_TYPE = 0xCC;
         private const int ITEMDEF_MIN_OBJ = 0x20;
 
         /// <summary>
@@ -644,6 +730,11 @@ namespace GK2Trainer
         public List<string> FindAllItemDefIds()
         {
             List<string> ids = new List<string>();
+            ItemDefAttrs.Clear();          // 【2026-09-26】与 ids 同生命周期，避免跨次累积
+            ItemDefQuality.Clear();        // 同上
+            ItemDefType.Clear();           // 同上（ItemType：分组键的一半）
+            ItemDefInstAddr.Clear();       // 同上（地址字典：仅本进程内有效）
+            ItemDefIdPtr.Clear();          // 同上
             try
             {
                 List<MemRegion> targets = HeapRegions();
@@ -652,43 +743,45 @@ namespace GK2Trainer
 
                 List<long>[] partAddr = new List<long>[n];
                 List<long>[] partVt = new List<long>[n];
-                // 【P0-①】线程本地复用缓冲（原实现单次扫描分配 4.9 GB、Gen2 GC 27 次）
-                System.Threading.ThreadLocal<byte[]> tl =
-                    new System.Threading.ThreadLocal<byte[]>(delegate { return new byte[CHUNK]; });
-
-                System.Threading.Tasks.Parallel.For(0, n, delegate(int ri)
+                // 【P0-①】线程本地复用缓冲（原实现单次扫描分配 4.9 GB、Gen2 GC 27 次）。
+                // 【审核轮 2026-09-26】加 using：LOH 缓冲扫描结束立即归还。
+                using (System.Threading.ThreadLocal<byte[]> tl =
+                    new System.Threading.ThreadLocal<byte[]>(delegate { return new byte[CHUNK]; }))
                 {
-                    MemRegion r = targets[ri];
-                    List<long> a = new List<long>();
-                    List<long> v = new List<long>();
-                    byte[] buf = tl.Value;
-                    long off = 0;
-                    while (off < r.Size)
+                    System.Threading.Tasks.Parallel.For(0, n, delegate(int ri)
                     {
-                        int want = (int)Math.Min((long)CHUNK, r.Size - off);
-                        if (want < ITEMDEF_MIN_OBJ) break;
-                        int got = _mem.ReadInto(r.Base + off, buf, want);
-                        if (got > ITEMDEF_MIN_OBJ)
+                        MemRegion r = targets[ri];
+                        List<long> a = new List<long>();
+                        List<long> v = new List<long>();
+                        byte[] buf = tl.Value;
+                        long off = 0;
+                        while (off < r.Size)
                         {
-                            int limit = got - ITEMDEF_MIN_OBJ;
-                            for (int i = 0; i <= limit; i += 8)
+                            int want = (int)Math.Min((long)CHUNK, r.Size - off);
+                            if (want < ITEMDEF_MIN_OBJ) break;
+                            int got = _mem.ReadInto(r.Base + off, buf, want);
+                            if (got > ITEMDEF_MIN_OBJ)
                             {
-                                long vt = BitConverter.ToInt64(buf, i);
-                                if (!MaybeHeap(vt)) continue;
-                                long sync = BitConverter.ToInt64(buf, i + ITEMDEF_SYNC);
-                                if (sync != 0) continue;
-                                long idp = BitConverter.ToInt64(buf, i + ITEMDEF_ID);
-                                if (!MaybeHeap(idp)) continue;
-                                a.Add(r.Base + off + i);
-                                v.Add(vt);
+                                int limit = got - ITEMDEF_MIN_OBJ;
+                                for (int i = 0; i <= limit; i += 8)
+                                {
+                                    long vt = BitConverter.ToInt64(buf, i);
+                                    if (!MaybeHeap(vt)) continue;
+                                    long sync = BitConverter.ToInt64(buf, i + ITEMDEF_SYNC);
+                                    if (sync != 0) continue;
+                                    long idp = BitConverter.ToInt64(buf, i + ITEMDEF_ID);
+                                    if (!MaybeHeap(idp)) continue;
+                                    a.Add(r.Base + off + i);
+                                    v.Add(vt);
+                                }
                             }
+                            if (want < CHUNK) break;
+                            off += want - (off + want < r.Size ? OVERLAP : 0);
                         }
-                        if (want < CHUNK) break;
-                        off += want - (off + want < r.Size ? OVERLAP : 0);
-                    }
-                    partAddr[ri] = a;
-                    partVt[ri] = v;
-                });
+                        partAddr[ri] = a;
+                        partVt[ri] = v;
+                    });
+                }
 
                 // 合并 + 统计 vtable 频次
                 List<long> candAddr = new List<long>();
@@ -732,13 +825,31 @@ namespace GK2Trainer
                 if (finalVt == 0) return ids;
 
                 HashSet<string> seen = new HashSet<string>();
+                // 【2026-09-26】同一遍扫描里顺带读红白骷髅（零额外扫描成本）——
+                // 供物品下拉显示属性标注，使同名变体可区分（如两条「骨骼（铜星）」）。
                 for (int i = 0; i < candAddr.Count; i++)
                 {
                     if (candVt[i] != finalVt) continue;
-                    string id = ReadMonoString(_mem.ReadLong(candAddr[i] + ITEMDEF_ID));
+                    long idPtr = _mem.ReadLong(candAddr[i] + ITEMDEF_ID);
+                    string id = ReadMonoString(idPtr);
                     if (id == null || id.Length == 0 || id.Length > 64) continue;
                     if (!IsAsciiId(id)) continue;
-                    if (seen.Add(id)) ids.Add(id);
+                    if (seen.Add(id))
+                    {
+                        ids.Add(id);
+                        // 只读 4 字节字段本身；偏移见 ITEMDEF_RED_SKULLS / ITEMDEF_WHITE_SKULLS 的注释
+                        int red = _mem.ReadInt(candAddr[i] + ITEMDEF_RED_SKULLS);
+                        int white = _mem.ReadInt(candAddr[i] + ITEMDEF_WHITE_SKULLS);
+                        ItemDefAttrs[id] = new int[] { red, white };
+                        // 【2026-09-26 · 方案C 前置】同遍读出星级并登记实例/字符串指针（零额外扫描）
+                        int qual = _mem.ReadInt(candAddr[i] + ITEMDEF_QUALITY);
+                        int qtype = _mem.ReadInt(candAddr[i] + ITEMDEF_QUALITY_TYPE);
+                        ItemDefQuality[id] = new int[] { qual, qtype };
+                        // 【2026-09-26 · 方案C】ItemType（分组键的一半）：+0xCC，实测 814/814
+                        ItemDefType[id] = _mem.ReadInt(candAddr[i] + ITEMDEF_TYPE);
+                        ItemDefInstAddr[id] = candAddr[i];
+                        ItemDefIdPtr[id] = idPtr;
+                    }
                 }
             }
             // 【t3 C-1】异常不再静默吞掉：否则预热会「看起来成功但返回空表」，
@@ -760,6 +871,47 @@ namespace GK2Trainer
 
         /// <summary>ItemDef 类的真 vtable（由 FindAllItemDefIds 现场标定；随进程变化，不写死）。</summary>
         public long ItemDefVTable = 0;
+
+        /// <summary>
+        /// 物品 id → [redSkulls, whiteSkulls]（由 <see cref="FindAllItemDefIds"/> 在同一遍扫描中填充）。
+        /// 【2026-09-26 新增】用途：物品下拉显示红白骷髅标注，使同名变体可区分
+        /// （如 `bones_0_0:1` 红0白0 与 `bones_0_1:1` 红0白1 都叫「骨骼（铜星）」）。
+        /// 每次 <see cref="FindAllItemDefIds"/> 开始时会先清空。
+        /// </summary>
+        public readonly Dictionary<string, int[]> ItemDefAttrs = new Dictionary<string, int[]>();
+
+        /// <summary>
+        /// 物品 id → [quality, qualityType]（由 <see cref="FindAllItemDefIds"/> 同一遍扫描填充）。
+        /// 【2026-09-26 新增 · 方案C 前置】偏移见 <see cref="ITEMDEF_QUALITY"/> 注释（实测 814/814）。
+        /// `qualityType == 0` ⇒ 该物品**不分星级**（全库 645 条）；`== 1` ⇒ 有星级（169 条，归并 53 个物品名）。
+        /// 用途：物品星级二级菜单的置灰判定（不分星级 ⇒ 置灰不可展开）。
+        /// 纯数据、与地址无关 ⇒ 可随名表/属性缓存一同落盘（见 CacheStore）。
+        /// </summary>
+        public readonly Dictionary<string, int[]> ItemDefQuality = new Dictionary<string, int[]>();
+
+        /// <summary>
+        /// 物品 id → `ItemType` 枚举值（`int`；由 <see cref="FindAllItemDefIds"/> 同一遍扫描填充）。
+        /// 【2026-09-26 新增 · 方案C 前置】偏移见 <see cref="ITEMDEF_TYPE"/>（实测 814/814）。
+        /// 用途：「物品种类修改」分组键 = **中文名 + ItemType**。
+        /// ⚠ 本字典存的是**枚举数值**；UI 若要显示名称需自行做「数值 → 中文名」映射
+        /// （枚举定义见反编译源码 `public enum ItemType`；None=0 … Bag=400、Demon=666）。
+        /// </summary>
+        public readonly Dictionary<string, int> ItemDefType = new Dictionary<string, int>();
+
+        /// <summary>
+        /// 物品 id → ItemDef **实例地址**（堆扫描现场值）。
+        /// ⚠ **地址只存活于本进程内存，绝不落盘**（红线③：地址跨进程必失效）。
+        /// 仅供方案C「写入」阶段在同一进程内使用（读目标物品的字段值 / 校验写入前后一致）。
+        /// </summary>
+        public readonly Dictionary<string, long> ItemDefInstAddr = new Dictionary<string, long>();
+
+        /// <summary>
+        /// 物品 id → 该 ItemDef 上 `id` 字段指向的 **MonoString 指针**（UTF-16LE 内容）。
+        /// ⚠ 同 <see cref="ItemDefInstAddr"/>：**地址不落盘**。
+        /// 用途：方案C 若需把 Item 的 id 指向另一个字符串，可复用游戏内存里**已存在**的字符串，
+        /// 从而完全避免自行分配 MonoString（不触发 GC 分配、不写入游戏堆的未知区域）。
+        /// </summary>
+        public readonly Dictionary<string, long> ItemDefIdPtr = new Dictionary<string, long>();
         // ------------------------------------------------------------------
 
 
@@ -972,7 +1124,14 @@ namespace GK2Trainer
         //   +0x38 Dictionary（容器才有）
         //   +0x40 count    (int32) ← 只写 4 字节！容器上 +0x44 是容量，
         //                            按 8 字节写会把容量字段一起写坏。
-        //   +0x44 容器容量（普通物品恒 0）  +0x48 容器已用格数（== List._size）
+        //   +0x44 inventorySize (int32)      +0x48 inventoryFillSize (int32, 源码默认 -1)
+        // 【2026-09-26 口径修正 · 实测来源 tools\Probe-ItemFields.cs，样本 bag25/heap256】
+        //   旧注释把 +0x44/+0x48 写成「容器容量 / 容器已用格数（== List._size）」，**不准确**：
+        //   静态字段是 Item.inventorySize / Item.inventoryFillSize（后者声明为 `= -1`）。
+        //   实测：普通背包物品 +0x44 = 0、+0x48 = -1（**正是源码默认值**，不是"已用格数"）；
+        //   只有**玩家主库存**这一个对象上 +0x48 恰好等于 List._size（11 == 11）。
+        //   ⚠ 因此 **`+0x48 == List._size` 不是通用判据**，它在 `fillSize` 未被维护的容器上不成立；
+        //     任何新增的容器识别逻辑都不得只依赖它（既有判据保留原样，未做未经验证的改动）。
         //
         // List<T>：+0x10 T[] _items, +0x18 int32 _size
         // 数组    ：+0x10 bounds（szarray 为 NULL）, +0x18 max_length, +0x20 元素0
@@ -984,7 +1143,12 @@ namespace GK2Trainer
         public const int ITEM_LIST = 0x30;
         public const int ITEM_DICT = 0x38;
         public const int ITEM_COUNT = 0x40;
-        public const int ITEM_CAPACITY = 0x44;
+        public const int ITEM_CAPACITY = 0x44;   // 实为 Item.inventorySize（见上方口径修正）
+        /// <summary>
+        /// 实为 `Item.inventoryFillSize`（源码声明 `= -1`），**不是**「容器已用格数」。
+        /// 实测：普通背包物品恒为 −1；仅在玩家主库存上恰好等于 `List._size`。
+        /// ⚠ 名称沿用旧值以免大面积改名；**新增逻辑不要依赖 `ITEM_USED == LIST_SIZE`**。
+        /// </summary>
         public const int ITEM_USED = 0x48;
         public const int ITEM_SIZE = 0x50;
 
@@ -992,6 +1156,8 @@ namespace GK2Trainer
         public const int LIST_SIZE = 0x18;
         public const int ARRAY_LEN = 0x18;
         public const int ARRAY_DATA = 0x20;
+        /// <summary>GameRes.resValues（List&lt;GameResAtom&gt;）偏移；反编译源码佐证（GameRes 类首引用字段）。</summary>
+        public const int GAMERES_RESVALUES = 0x10;
 
         /// <summary>游戏内部给玩家主库存打的标签（语义锚，不是硬编码地址）。</summary>
         // （2026-09-23 删除）原「语义锚 tag」常量已移除：实测该 tag 不是身份标识
@@ -1072,7 +1238,11 @@ namespace GK2Trainer
         /// </summary>
         public long FindPlayerInventory()
         {
-            // 热路径：锚地址仍有效则直接复用（换档/重载后 IsAnchorStillValid 会失败）
+            // 热路径：锚**既仍指向当前存档、又结构可读**时直接复用（微秒级）。
+            // 【P0a 语义边界】这里的 IsAnchorStillValid() 是**复用前的廉价校验**（身份 ∧ 结构），
+            //   失败只表示「不能复用缓存」⇒ 落到下面的冷路径**重新解析一次**（不清空、不降态）；
+            //   它**不承担换档语义** —— 换档 / 回主菜单判定在 TrainerForm.MonitorLifecycle，
+            //   那里只用 IsSameSaveSlot()（结构抖动不得触发重载）。
             if (PlayerInventory != 0 && IsAnchorStillValid())
                 return PlayerInventory;
 
@@ -1307,30 +1477,66 @@ namespace GK2Trainer
         }
 
         /// <summary>
-        /// 【热路径】廉价校验：缓存的锚是否仍指向**当前**存档的主背包。
-        /// 只做几次读取，且绕过类名缓存 —— 否则地址失效后旧缓存会造成假命中。
+        /// 【换档判据·唯一决定性信号】静态槽是否仍指向缓存的 PlayerData（身份引用）。
         ///
-        /// 换档判据（关键）：读 static_data 块的 <c>STATIC_SLOT_PLAYERDATA</c>，
-        /// 与缓存的 CurrentPlayerData 比对。static_data 块地址在同一次会话内稳定
-        /// （只在进程启动时变），而槽内容会在读档时被游戏改写成新 PD ——
-        /// 所以「槽值 != 缓存 PD」就是换档/重载的**正向**信号（成本 1 次读内存）。
+        /// 读 static_data 块的 <c>STATIC_SLOT_PLAYERDATA</c>，与缓存的 CurrentPlayerData 比对。
+        /// static_data 块地址在同一次会话内稳定（只在进程启动时变），而槽内容会在读档时被
+        /// 游戏改写成新 PD —— 所以「槽值 != 缓存 PD」就是换档 / 重载的**正向**信号
+        /// （成本 1 次读内存）。
         ///
         /// 不能只靠结构校验：实测读档后旧对象不释放，旧 PD 的
         /// +0x58 → Inventory → +0x38 → Item 链结构依然完全合法，会被误判为「仍有效」，
         /// 从而继续用旧档数据（用户最初报告的缺陷复发路径）。
+        ///
+        /// 本游戏**没有游戏内读档**：存档必须睡觉，读档必须回主菜单再继续 / 读档
+        /// ⇒ 「换档」是稀疏事件，且**必然**改写该静态槽。因此只需这一个信号。
+        ///
+        /// **结构完好性不在此方法内**（见 <see cref="IsAnchorReadable"/>）：结构判据回答不了
+        /// 「是不是当前那一个」，只能回答「此刻读不读得到」。旧实现把两者 AND 进同一个 bool，
+        /// 导致「背包被清空（容器 size == 0）」这类结构抖动被调用方当成换档 ⇒ 清空重载
+        /// （实测误判持续 57.8 s）。换档 / 回主菜单判定**必须**用本方法。
         /// </summary>
-        public bool IsAnchorStillValid()
+        public bool IsSameSaveSlot()
         {
             if (CurrentPlayerData <= 0x10000) return false;
 
             // 【换档判据】static_data 块 + 静态槽仍指向缓存的 PD？
             if (AnchorStaticData <= 0x10000) return false;
-            if (_mem.ReadLong(AnchorStaticData + STATIC_SLOT_PLAYERDATA) != CurrentPlayerData) return false;
+            return _mem.ReadLong(AnchorStaticData + STATIC_SLOT_PLAYERDATA) == CurrentPlayerData;
+        }
+
+        /// <summary>
+        /// 【结构可读性·必要条件】缓存的锚结构此刻是否可读
+        /// （PD 类名 + PlayerInventory 有效 + 容器自洽）。
+        /// 只做几次读取，且绕过类名缓存 —— 否则地址失效后旧缓存会造成假命中。
+        ///
+        /// **只回答「这一轮能不能读」，绝不回答「是不是当前那一个」** ——
+        /// 失败只允许触发「重新解析一次」或记诊断，**不得触发换档 / 清空重载**
+        /// （旧实现把本判据混进换档判据，是「背包清空被误判为读档」的根因；
+        /// 结构抖动是合法且常见的：背包空、过图、容器重排都会让它瞬时为 false）。
+        /// </summary>
+        public bool IsAnchorReadable()
+        {
+            if (CurrentPlayerData <= 0x10000) return false;
 
             // 以下为必要条件（结构完好性），不可单独作为换档判据
             if (GetClassNameUncached(_mem.ReadLong(CurrentPlayerData)) != PLAYERDATA_CLASS) return false;
             if (PlayerInventory <= 0x10000) return false;
             return IsPlayerInventory(PlayerInventory);
+        }
+
+        /// <summary>
+        /// 【兼容保留】旧方法 = <see cref="IsSameSaveSlot"/> ∧ <see cref="IsAnchorReadable"/>，
+        /// 与原实现的语义逐字等价（短路顺序亦一致）。
+        ///
+        /// 适用场景只有一个：**复用缓存前的廉价校验** —— 既要求锚仍指向当前存档，
+        /// 又要求此刻结构可读；失败后果是**重新解析**（冷路径），**不是**换档重载。
+        /// **换档 / 回主菜单判定不得使用本方法**（那会把结构抖动误判成换档），
+        /// 请改用 <see cref="IsSameSaveSlot"/>。
+        /// </summary>
+        public bool IsAnchorStillValid()
+        {
+            return IsSameSaveSlot() && IsAnchorReadable();
         }
 
         /// <summary>
@@ -1395,10 +1601,14 @@ namespace GK2Trainer
         /// <summary>
         /// 不经缓存的类名读取：地址失效检测必须绕过缓存，
         /// 否则已释放的旧地址会一直返回记忆中的旧类名（假命中）。
+        /// 同样需要掩掉 GC 借用的最低位（依据见 <see cref="GC_MARK_BIT_MASK"/> 的注释）——
+        /// `IsAnchorReadable()` 正是走这条路读 PlayerData 类名，不掩码则过图/传送时
+        /// 会因标记位污染而误判为「结构不可读」（P0a 之后不再升级为「读档 / 回主菜单」）。
         /// </summary>
         private string GetClassNameUncached(long vtable)
         {
             if (vtable <= 0x10000 || vtable >= 0x7FFFFFFF0000L) return null;
+            vtable &= GC_MARK_BIT_MASK;          // 去掉 GC 借用的标记位
             long klass = _mem.ReadLong(vtable + MONO_VTABLE_KLASS);
             if (klass <= 0x10000 || klass >= 0x7FFFFFFF0000L) return null;
             long namep = _mem.ReadLong(klass + MONO_CLASS_NAME);
@@ -1420,12 +1630,29 @@ namespace GK2Trainer
             string lc = GetClassName(_mem.ReadLong(list));
             if (lc == null || lc.IndexOf("List") < 0) return false;
 
+            // 【P0b 2026-09-26】`size == 0`（背包被清空）是**合法状态**，不得判为无效容器。
+            //   实测（evidence\cause2_play_r1\anchor.csv，527 个 size=0 采样点）：
+            //   used=0 / size=0 / cap=20 / arrLen=34，pdClassOk、invOk 全为 1 —— 其余子项
+            //   **全部成立**，唯一失败项就是原来的 `size < 1`（既导致定位失败，又经旧
+            //   IsAnchorStillValid 被误判为换档）。放宽仅限「空」这一种合法状态：
+            //   下界改为只拒绝 size < 0（读坏值），上界由紧随其后的 `size > cap` 补齐。
             int size = _mem.ReadInt(list + LIST_SIZE);
-            if (size < 1) return false;
-            // 容器结构一致性：+0x48 已用格数必须等于 List._size
+            if (size < 0) return false;
+            // 容器结构一致性：+0x48 必须等于 List._size
+            // 【2026-09-26 口径标注 · 未改判据】实测该字段语义是 `Item.inventoryFillSize`
+            //   （源码默认 −1），只在**玩家主库存**上恰好等于 List._size。
+            //   本判据在既有实测覆盖到的容器（主背包 / 研究台 / 附近箱子）上都成立，故**保留原样**；
+            //   但它的成立依赖「游戏已维护 fillSize」，属**潜在误拒风险**（可能拒绝一个合法容器 ⇒
+            //   表现为「资源组未找到」）。已登记为待观察项，未做未经验证的放宽。
             if (_mem.ReadInt(item + ITEM_USED) != size) return false;
             int cap = _mem.ReadInt(item + ITEM_CAPACITY);
             if (cap < 1 || cap > 1024) return false;
+            // 【P0b 新增比较·收紧】结构自洽性：已用格数不可能超过容量。
+            //   旧实现无此项；它的意义是补偿 `size == 0` 时 `arrLen >= size` 退化为恒真
+            //   所损失的判别力。依据：item+0x44 实为 Item.inventorySize（容量），
+            //   item+0x30 的 List._size 为已用格数。实测 4546 样本中 size > cap 出现 0 次
+            //   （cap 恒 20、size ≤ 19）⇒ 本项在实测覆盖范围内零影响；方向安全（拒绝优于选错）。
+            if (size > cap) return false;
 
             long arr = _mem.ReadLong(list + LIST_ARR);
             if (arr == 0) return false;
@@ -1636,7 +1863,7 @@ namespace GK2Trainer
             try
             {
                 if (CurrentPlayerData <= 0x10000 || CurrentGameRes <= 0x10000) return res;
-                long list = _mem.ReadLong(CurrentGameRes + 0x10);
+                long list = _mem.ReadLong(CurrentGameRes + GAMERES_RESVALUES);
                 if (list <= 0x10000) return res;
                 long arr = _mem.ReadLong(list + LIST_ARR);
                 if (arr <= 0x10000) return res;
@@ -1646,7 +1873,7 @@ namespace GK2Trainer
                 if (arrCls == null || arrCls.IndexOf("GameResAtom") < 0) return res;
                 for (int i = 0; i < n; i++)
                 {
-                    long a = _mem.ReadLong(arr + 0x20 + i * 8);
+                    long a = _mem.ReadLong(arr + ARRAY_DATA + i * 8);
                     if (a <= 0x10000) continue;
                     long vt = _mem.ReadLong(a);
                     if (vt <= 0x10000) continue;
@@ -1874,6 +2101,40 @@ namespace GK2Trainer
         private volatile int _locIndexEntries = 0;
         private double _locIndexSeconds = 0.0;
 
+        // ------------------------------------------------------------------
+        // 【方案A】运行时别名表 aliases1/aliases2（LazyBearTechnology.LLBase 的 public 实例字段，
+        //   List<string>，随语言对象从 resources.assets 反序列化）。
+        //   与词表 **_locNames 完全独立**存放：查询时串联，绝不合并（合并会污染
+        //   CopyLocalizedNames / LocalizedNameCount 的语义与缓存指纹）。
+        //   定位链与词表同构：内容锚点字符串 → String[] 数组头(r-0x20) → List<string>(+0x10)
+        //   → LL 实例（ClassNameOf == "LL" 且 id == "zh_cn"）→ aliases1 @ +0x30 / aliases2 @ +0x38。
+        //   偏移由运行时标定（不硬编码），并逐条与词表交叉验证；任一不过即整体拒绝。
+        // ------------------------------------------------------------------
+        private readonly List<string> _aliasFrom = new List<string>();
+        private readonly List<string> _aliasTo = new List<string>();
+        /// <summary>别名键 → aliases1 中的**首次**出现下标（复刻 List.IndexOf 语义）。</summary>
+        private readonly Dictionary<string, int> _aliasIndex = new Dictionary<string, int>();
+        private volatile bool _aliasIndexBuilt = false;
+        private volatile bool _aliasIndexFailed = false;
+        private volatile int _aliasIndexEntries = 0;
+        private double _aliasIndexSeconds = 0.0;
+        private string _aliasIndexDiag = "尚未建立";
+
+        /// <summary>别名跟链的防环保险。游戏 L() 是**无上限递归**，我们必须自己设上限。</summary>
+        private const int ALIAS_MAX_HOPS = 64;
+        /// <summary>别名表条数的合理区间（实测正式版 zh_cn 为 8709；给宽区间，不写死单值）。</summary>
+        private const int ALIAS_MIN_PLAUSIBLE = 1000;
+        private const int ALIAS_MAX_PLAUSIBLE = 20000;
+        /// <summary>内容锚点：离线/运行时别名表的首行 alias_from。是**内容**，不是地址。</summary>
+        private const string ALIAS_ANCHOR = "garden_empty_1_place";
+        /// <summary>四重内容验证的抽样规模。</summary>
+        private const int ALIAS_VERIFY_SAMPLE = 200;
+        private static readonly string[] KnownLangIds = new string[]
+        {
+            "en", "de", "fr", "pt-br", "es", "es-mx", "ru", "uk-ua", "it",
+            "pl", "tr", "ja", "zh_cn", "zh_cht", "ko", "th", "vn"
+        };
+
         /// <summary>
         /// 查一个 itemId 的中文名（数据来自游戏运行时内存）。
         /// 首次调用会按需建立中文词表索引（一次全堆扫描，数秒级）；
@@ -1931,6 +2192,11 @@ namespace GK2Trainer
                     seeds.Add(LocalizationSeedFallback[i]);
                 EnsureLocalizedNameIndex(seeds);
             }
+            else
+            {
+                // 【方案A】词表已就绪（含缓存装载路径）时，补建别名表
+                EnsureAliasIndex();
+            }
             if (itemIds == null) return 0;
 
             int hit = 0;
@@ -1951,6 +2217,18 @@ namespace GK2Trainer
             _locIndexSeed = "";
             _locIndexEntries = 0;
             _locIndexSeconds = 0.0;
+            // 【方案A】别名表与词表同生命周期：一起清（进程重连 / 换档 / 换语言后重建）
+            lock (_locGate)
+            {
+                _aliasFrom.Clear();
+                _aliasTo.Clear();
+                _aliasIndex.Clear();
+            }
+            _aliasIndexBuilt = false;
+            _aliasIndexFailed = false;
+            _aliasIndexEntries = 0;
+            _aliasIndexSeconds = 0.0;
+            _aliasIndexDiag = "尚未建立";
         }
 
         /// <summary>已建立的中文条目数（0 表示未建立或未取到）。</summary>
@@ -2001,6 +2279,9 @@ namespace GK2Trainer
             sw.Stop();
             _locIndexSeconds = sw.Elapsed.TotalSeconds;
             if (!_locIndexBuilt) _locIndexFailed = true;
+            // 【方案A】词表就绪后**并列**建立别名表。两者独立成败：
+            //   别名表建立失败 ⇒ 只让后续回退链退回纯词表，绝不影响词表索引本身。
+            if (_locIndexBuilt) EnsureAliasIndex();
             return _locIndexBuilt;
         }
 
@@ -2064,6 +2345,590 @@ namespace GK2Trainer
             _locIndexSeed = seed;
             _locIndexBuilt = true;
             return true;
+        }
+
+        // ==================================================================
+        // 【方案A】运行时别名表 aliases1/aliases2 —— 建立、索引与解析
+        //   静态依据（反编译源码 LazyBearTechnology.cs，方法名 LLBase.L / HasL / AddAliases）：
+        //     aliases1 / aliases2 = LLBase 的 public 实例字段，List<string>，
+        //     无 [NonSerialized] ⇒ 随语言对象从 resources.assets 反序列化；
+        //     持有者 = LLBase.currentLang（protected static LL）；LL : LLBase。
+        //     分配器 AddAliases() 保证两表**等长**且键去重。
+        //   定位链（与词表同构，全部由内容锚点自举，零地址硬编码）：
+        //     锚点字符串 → MonoString → ScanPointersTo → String[] 数组头(r-0x20)
+        //     → List<string>(_items@+0x10) → LL 实例（类名 == "LL" 且 id == "zh_cn"）
+        //     → aliases1 @ 运行时标定偏移 / aliases2 = 该偏移 + 8
+        //   验证不过 ⇒ 整体拒绝（_aliasIndexFailed），查询退回纯词表行为。
+        // ==================================================================
+
+        /// <summary>别名表是否已就绪（供 UI / 日志查询）。</summary>
+        public bool IsAliasTableReady { get { return _aliasIndexBuilt; } }
+
+        /// <summary>别名表的去重键条数（0 表示未建立或未采用）。</summary>
+        public int AliasTableCount { get { return _aliasIndexEntries; } }
+
+        /// <summary>
+        /// 【t34 · U1】别名表的**行数**（`_aliasFrom.Count`，**含重复键**；实测 8709）。
+        ///   ⚠ 与 <see cref="AliasTableCount"/>（**去重键数** `_aliasIndex.Count`，实测 8697）是
+        ///   **两个不同口径**，差值正是 `.alias` 正文里重复 from 的条数（离线实测 12 条）。
+        ///   凡是要与**缓存文件头**的条数比较的地方（`.alias` 的 `count`、名表缓存的 `alias=`）
+        ///   **必须用行数** —— 两个缓存文件记的都是行数。
+        ///   历史事故：自愈路径曾误传去重键数 8697，与 `.alias` 的 8709 不等 ⇒ 自愈写缓存之后
+        ///   每次启动都被 F4 的条数交叉判据误拒、退回现场全量重建。
+        /// </summary>
+        public int AliasTableRowCount { get { return _aliasFrom.Count; } }
+
+        /// <summary>别名表状态（供日志与报告使用）。</summary>
+        public string AliasTableStatus
+        {
+            get
+            {
+                if (_aliasIndexBuilt)
+                    return "已建立 " + _aliasIndexEntries + " 条（耗时 "
+                        + _aliasIndexSeconds.ToString("F1") + "s，" + _aliasIndexDiag + "）";
+                if (_aliasIndexFailed) return "建立失败：" + _aliasIndexDiag;
+                return "尚未建立";
+            }
+        }
+
+        /// <summary>建立别名表（幂等；已建立或已判定失败则直接返回）。</summary>
+        private void EnsureAliasIndex()
+        {
+            if (_aliasIndexBuilt || _aliasIndexFailed) return;
+            // 词表还没读到中文内容时不必建（交叉验证需要词表）
+            if (_locNames.Count == 0) { _aliasIndexDiag = "词表为空，跳过"; return; }
+            TryBuildAliasIndex();
+        }
+
+        /// <summary>
+        /// 建立运行时别名表索引。失败即置 <see cref="_aliasIndexFailed"/> 并清空半成品：
+        /// 「宁可不定位，不可选错」—— 验证不过就整体拒绝，绝不留半信半疑的表。
+        /// </summary>
+        private bool TryBuildAliasIndex()
+        {
+            if (_aliasIndexBuilt) return true;
+            if (_aliasIndexFailed) return false;
+
+            System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+            bool ok = false;
+            try
+            {
+                ok = TryBuildAliasIndexCore();
+            }
+            catch (Exception ex)
+            {
+                AddDiagnostic("TryBuildAliasIndex", ex);
+                _aliasIndexDiag = "异常 " + ex.GetType().Name;   // 只写异常类型名，不带地址
+                ok = false;
+            }
+            sw.Stop();
+            _aliasIndexSeconds = sw.Elapsed.TotalSeconds;
+
+            if (!ok)
+            {
+                lock (_locGate)
+                {
+                    _aliasFrom.Clear();
+                    _aliasTo.Clear();
+                    _aliasIndex.Clear();
+                }
+                _aliasIndexEntries = 0;
+                _aliasIndexFailed = true;
+                AddNote("方案A 别名表未采用（保持纯词表行为）：" + _aliasIndexDiag);
+                return false;
+            }
+
+            _aliasIndexBuilt = true;
+            AddNote("方案A 别名表已建立：" + _aliasIndexEntries + " 条，耗时 "
+                    + _aliasIndexSeconds.ToString("F1") + "s；" + _aliasIndexDiag);
+            return true;
+        }
+
+        private bool TryBuildAliasIndexCore()
+        {
+            _aliasIndexDiag = "";
+
+            // ① 内容锚点字符串（别名表首行 alias_from；是内容，不是地址）
+            List<long> objs = FindMonoStringObjects(ALIAS_ANCHOR, 16);
+            if (objs.Count == 0) { _aliasIndexDiag = "堆中未找到锚点字符串"; return false; }
+
+            // ② 反查底层 String[]：锚点是数组第 0 个元素 ⇒ 数组头 = r - ARRAY_DATA
+            List<long> refs = _mem.ScanPointersTo(objs, 20000);
+            List<long> arrs = new List<long>();
+            for (int i = 0; i < refs.Count; i++)
+            {
+                long r = refs[i];
+                long head = r - ARRAY_DATA;
+                if (head <= 0x10000) continue;
+                string acn = GetClassName(_mem.ReadLong(head));
+                if (acn == null || acn.IndexOf("[]") < 0) continue;
+                long maxLen = _mem.ReadLong(head + ARRAY_LEN);
+                if (maxLen < ALIAS_MIN_PLAUSIBLE || maxLen > ALIAS_MAX_PLAUSIBLE) continue;
+                if (r + 8 > head + ARRAY_DATA + maxLen * 8) continue;
+                if (ReadMonoString(_mem.ReadLong(head + ARRAY_DATA)) != ALIAS_ANCHOR) continue;
+                if (!arrs.Contains(head)) arrs.Add(head);
+            }
+            if (arrs.Count == 0) { _aliasIndexDiag = "未能反推出别名表底层数组"; return false; }
+
+            // ③ 数组 → List<string>（_items @ +0x10，_size @ +0x18）
+            long arr1 = 0, list1 = 0;
+            int size1 = 0;
+            for (int i = 0; i < arrs.Count && list1 == 0; i++)
+            {
+                List<long> r2 = _mem.ScanPointersTo(new List<long>(new long[] { arrs[i] }), 64);
+                for (int k = 0; k < r2.Count; k++)
+                {
+                    long cand = r2[k] - LIST_ARR;
+                    if (cand <= 0x10000) continue;
+                    string cn = GetClassName(_mem.ReadLong(cand));
+                    if (cn == null || cn.IndexOf("List") < 0) continue;
+                    int sz = _mem.ReadInt(cand + LIST_SIZE);
+                    if (sz < ALIAS_MIN_PLAUSIBLE || sz > ALIAS_MAX_PLAUSIBLE) continue;
+                    arr1 = arrs[i]; list1 = cand; size1 = sz;
+                    break;
+                }
+            }
+            if (list1 == 0) { _aliasIndexDiag = "未能反推出 List<string>"; return false; }
+
+            // ④ List → LL 实例：逐个试字段偏移，且**必须选中当前语言**（id == "zh_cn"）。
+            //    LL 实例可能不唯一（LL.englishLang 等）⇒ 不能见 LL 就用。
+            long llObj = 0, list2 = 0;
+            int off1 = 0;
+            List<long> r3 = _mem.ScanPointersTo(new List<long>(new long[] { list1 }), 64);
+            for (int k = 0; k < r3.Count && llObj == 0; k++)
+            {
+                for (int off = 0x08; off <= 0x200; off += 8)
+                {
+                    long cand = r3[k] - off;
+                    if (cand <= 0x10000) break;
+                    if (GetClassName(_mem.ReadLong(cand)) != "LL") continue;
+                    if (ReadLangIdAt(cand) != "zh_cn") continue;
+                    long l2 = _mem.ReadLong(cand + off + 8);
+                    if (l2 <= 0x10000) continue;
+                    string cn2 = GetClassName(_mem.ReadLong(l2));
+                    if (cn2 == null || cn2.IndexOf("List") < 0) continue;
+                    if (_mem.ReadInt(l2 + LIST_SIZE) != size1) continue;   // 两表等长（AddAliases 保证）
+                    llObj = cand; off1 = off; list2 = l2;
+                    break;
+                }
+            }
+            if (llObj == 0) { _aliasIndexDiag = "未找到 id==zh_cn 的 LL 实例（或字段偏移不匹配）"; return false; }
+
+            // ⑤ 读全量两表
+            long arr2 = _mem.ReadLong(list2 + LIST_ARR);
+            if (arr2 <= 0x10000) { _aliasIndexDiag = "aliases2 数组指针无效"; return false; }
+            long a1len = _mem.ReadLong(arr1 + ARRAY_LEN);
+            long a2len = _mem.ReadLong(arr2 + ARRAY_LEN);
+            if (a1len != a2len) { _aliasIndexDiag = "两表底层数组长度不等"; return false; }
+            if (a1len < ALIAS_MIN_PLAUSIBLE || a1len > ALIAS_MAX_PLAUSIBLE)
+            { _aliasIndexDiag = "底层数组长度超出合理区间"; return false; }
+
+            int n = (int)a1len;
+            byte[] raw1 = _mem.ReadBytes(arr1 + ARRAY_DATA, n * 8);
+            byte[] raw2 = _mem.ReadBytes(arr2 + ARRAY_DATA, n * 8);
+            if (raw1 == null || raw1.Length != n * 8 || raw2 == null || raw2.Length != n * 8)
+            { _aliasIndexDiag = "读取别名表原始槽失败"; return false; }
+
+            List<string> frm = new List<string>(n);
+            List<string> to = new List<string>(n);
+            for (int i = 0; i < n; i++)
+            {
+                frm.Add(ReadMonoString(BitConverter.ToInt64(raw1, i * 8)));
+                to.Add(ReadMonoString(BitConverter.ToInt64(raw2, i * 8)));
+            }
+
+            // ---------- 四重内容验证（任一不过 ⇒ 整体拒绝）----------
+            // ① 条数：两表等长（已校验 a1len==a2len）且落在合理区间、与 List._size 一致
+            if (n != size1) { _aliasIndexDiag = "List._size 与底层数组长度不一致"; return false; }
+
+            Dictionary<string, int> probe = new Dictionary<string, int>();
+            for (int i = 0; i < n; i++)
+            {
+                if (frm[i] == null || frm[i].Length == 0) continue;
+                if (!probe.ContainsKey(frm[i])) probe[frm[i]] = i;   // 复刻 List.IndexOf 的首次出现语义
+            }
+
+            // 【t34 · F5】形态（②）改为**全量**统计：原实现等距抽 `ALIAS_VERIFY_SAMPLE`(=200) 条、
+            //   步长 ≈43，真表里 7 行非标识符内容被整批漏检（判据报 200/200 全过）。
+            //   ③④ 仍按抽样（需查词表 + 跟链，成本高一个量级）。
+            //   阈值保持 90% **不收紧**：那 7 行是真实数据形态，收紧会误拒真表；
+            //   本项改进的价值是「把真实数字报出来」，而不是改判据口径。
+            int sample = Math.Min(n, ALIAS_VERIFY_SAMPLE);
+            int shapeOk = 0, shapeBad = 0, outsideLoc = 0, cjkViaChain = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (IsAsciiId(frm[i]) && IsAsciiId(to[i])) shapeOk++;
+                else shapeBad++;
+            }
+            for (int s = 0; s < sample; s++)
+            {
+                int i = (int)((long)s * n / sample);
+                string k = frm[i];
+                // ③ 区分度：别名键必须**不在**中文词表里（否则读到的是词表，不是别名表）
+                bool inLoc;
+                lock (_locGate) { inLoc = _locNames.ContainsKey(k); }
+                if (!inLoc) outsideLoc++;
+                // ④ 交叉：跟链到不动点后应能在中文词表里解析出中文
+                string tail = AliasChainOf(k, probe, to);
+                string zh;
+                bool hit;
+                lock (_locGate) { hit = _locNames.TryGetValue(tail, out zh) && HasCjk(zh); }
+                if (hit) cjkViaChain++;
+            }
+            if (shapeOk * 10 < n * 9)
+            {
+                _aliasIndexDiag = "形态验证不过（ASCII 标识符 " + shapeOk + "/" + n
+                                + "，非标识符行 " + shapeBad + "）";
+                return false;
+            }
+            if (outsideLoc * 10 < sample * 8)
+            {
+                _aliasIndexDiag = "与词表区分度不足（不在词表的键 " + outsideLoc + "/" + sample + "）";
+                return false;
+            }
+            if (cjkViaChain * 10 < sample * 6)
+            {
+                _aliasIndexDiag = "交叉验证不过（链尾可解析中文 " + cjkViaChain + "/" + sample + "）";
+                return false;
+            }
+
+            // ⑥ 登记（跨线程共享 → 持锁整体替换）
+            lock (_locGate)
+            {
+                _aliasFrom.Clear();
+                _aliasTo.Clear();
+                _aliasIndex.Clear();
+                for (int i = 0; i < n; i++)
+                {
+                    _aliasFrom.Add(frm[i]);
+                    _aliasTo.Add(to[i]);
+                    string k = frm[i];
+                    if (k != null && k.Length > 0 && !_aliasIndex.ContainsKey(k))
+                        _aliasIndex[k] = i;
+                }
+                _aliasIndexEntries = _aliasIndex.Count;
+            }
+
+            _aliasIndexDiag = "底层 " + n + " 条（形态全量 " + shapeOk + "/" + n
+                + "，非标识符 " + shapeBad + "；抽样 " + sample + " 条：非词表键 " + outsideLoc
+                + " / 链尾含中文 " + cjkViaChain + "），偏移 aliases1@+0x"
+                + off1.ToString("X") + " aliases2@+0x" + (off1 + 8).ToString("X");
+            return true;
+        }
+
+        /// <summary>
+        /// 纯函数版别名跟链（建表验证期使用，不依赖已登记的 <see cref="_aliasIndex"/>）。
+        /// 带防环：visited 集合 + <see cref="ALIAS_MAX_HOPS"/> 上限。
+        /// </summary>
+        private static string AliasChainOf(string key, Dictionary<string, int> probe, IList<string> to)
+        {
+            if (key == null || key.Length == 0) return key;
+            string cur = key;
+            HashSet<string> seen = new HashSet<string>();
+            seen.Add(cur);
+            for (int hop = 0; hop < ALIAS_MAX_HOPS; hop++)
+            {
+                int idx;
+                if (!probe.TryGetValue(cur, out idx)) return cur;
+                if (idx < 0 || idx >= to.Count) return cur;
+                string nxt = to[idx];
+                if (nxt == null || nxt.Length == 0) return cur;
+                if (!seen.Add(nxt)) return cur;      // 环：在进入环之前截断
+                cur = nxt;
+            }
+            return cur;                              // 达到跳数上限：返回当前值
+        }
+
+        /// <summary>
+        /// 【方案A】只跟别名链，返回链尾（无别名命中则返回 key 本身）。
+        /// 线程安全；带防环（visited + 跳数上限），并对截断记一条诊断。
+        /// </summary>
+        public string ResolveAliasChain(string key)
+        {
+            if (key == null || key.Length == 0) return key;
+            if (!_aliasIndexBuilt) return key;
+
+            string notes = null;
+            string result = key;
+            lock (_locGate)
+            {
+                if (_aliasIndex.Count == 0) return key;
+                string cur = key;
+                HashSet<string> seen = new HashSet<string>();
+                seen.Add(cur);
+                for (int hop = 0; hop < ALIAS_MAX_HOPS; hop++)
+                {
+                    int idx;
+                    if (!_aliasIndex.TryGetValue(cur, out idx)) break;
+                    if (idx < 0 || idx >= _aliasTo.Count) break;
+                    string nxt = _aliasTo[idx];
+                    if (nxt == null || nxt.Length == 0) break;
+                    if (!seen.Add(nxt))
+                    {
+                        notes = "别名链存在环，已在 " + hop + " 跳后截断（key 前 32 字符："
+                                + TruncateForLog(key, 32) + "）";
+                        break;
+                    }
+                    cur = nxt;
+                    if (hop == ALIAS_MAX_HOPS - 1)
+                        notes = "别名链超过 " + ALIAS_MAX_HOPS + " 跳上限，已截断（key 前 32 字符："
+                                + TruncateForLog(key, 32) + "）";
+                }
+                result = cur;
+            }
+            if (notes != null) AddNote(notes);
+            return result;
+        }
+
+        /// <summary>
+        /// 【方案A】按游戏 <c>LLBase.L(key)</c> 的语义解析中文名：
+        ///   **别名优先**（命中即跟链到不动点）→ 查中文词表 → 都没有返回 null
+        ///   （由调用方兜底显示**原始 id**）。
+        /// 与游戏的一处**有意差异**（如实登记）：游戏在链尾也查不到时会返回链尾原文；
+        /// 本方法返回 null，因为调用方的兜底是「显示原始 id」——观感一致，且不引入非中文伪结果。
+        /// </summary>
+        public string ResolveLocalizedWithAlias(string key)
+        {
+            if (key == null || key.Length == 0) return null;
+            string tail = ResolveAliasChain(key);
+            string hit;
+            lock (_locGate)
+            {
+                if (_locNames.TryGetValue(tail, out hit) && hit != null && hit.Length > 0) return hit;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 【方案A · t29 返工】导出已登记的别名表（成对、**保序**、含重复键），供落盘缓存与
+        /// UI 侧实例共享。导出的是**纯字符串数据**，不含任何地址或偏移。未就绪返回 false。
+        /// </summary>
+        public bool TryExportAliasTable(out List<string> from, out List<string> to)
+        {
+            from = null; to = null;
+            if (!_aliasIndexBuilt) return false;
+            lock (_locGate)
+            {
+                if (_aliasFrom.Count == 0 || _aliasFrom.Count != _aliasTo.Count) return false;
+                from = new List<string>(_aliasFrom);
+                to = new List<string>(_aliasTo);
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 【方案A · t29 返工】从缓存导入别名表（缓存命中路径用；也可用于把现场建好的表
+        /// 共享给 UI 侧另一个实例）。做**内容级**校验：
+        ///   ① 两列等长且条数 ∈ [ALIAS_MIN_PLAUSIBLE, ALIAS_MAX_PLAUSIBLE]；
+        ///   ② 抽样 ALIAS_VERIFY_SAMPLE 条，键与值都必须是 ASCII 标识符（比例 ≥ 90%）。
+        /// 若当前**恰好**已有中文词表（刷新路径），额外做与现场建表同样的两项：
+        ///   ③ 别名键不在词表（≥80%）；④ 链尾能在词表解析出中文（≥60%）。
+        /// 缓存路径下词表为空时 ③④ 跳过，并在 note 里**如实标注**（不当成已验证）。
+        /// 校验不过 ⇒ 拒绝导入并置 <see cref="_aliasIndexFailed"/>（下次启动会强制重试现场读取）。
+        /// </summary>
+        public bool TryImportAliasTable(IList<string> from, IList<string> to, out string note)
+        {
+            note = "";
+            if (_aliasIndexBuilt) { note = "别名表已就绪，忽略导入"; return true; }
+            if (from == null || to == null) { note = "导入数据为空"; return false; }
+            int n = from.Count;
+            if (n != to.Count)
+            {
+                _aliasIndexFailed = true;
+                note = "两列长度不等（" + n + " vs " + to.Count + "），已拒绝（下次启动强制重试）";
+                return false;
+            }
+            if (n < ALIAS_MIN_PLAUSIBLE || n > ALIAS_MAX_PLAUSIBLE)
+            {
+                _aliasIndexFailed = true;
+                note = "条数超出合理区间（" + n + "），已拒绝（下次启动强制重试）";
+                return false;
+            }
+
+            Dictionary<string, int> probe = new Dictionary<string, int>();
+            for (int i = 0; i < n; i++)
+            {
+                string k = from[i];
+                if (k == null || k.Length == 0) continue;
+                if (!probe.ContainsKey(k)) probe[k] = i;
+            }
+
+            bool haveLoc;
+            lock (_locGate) { haveLoc = _locNames.Count > 0; }
+
+            // 【t34 · F5】形态检查改为**全量**：原实现等距抽 `ALIAS_VERIFY_SAMPLE`(=200) 条、
+            //   步长 ≈43，实测真表里 7 行非标识符内容被整批漏检（判据报 200/200 全过）。
+            //   全量统计的成本只是纯内存字符扫描（8709×2 次 `IsAsciiId`）。
+            //   ③④ 仍按抽样（它们要查词表 + 跟链，成本高一个量级）。
+            //   注意：阈值保持 90% **不收紧** —— 那 7 行是真实数据形态（如含 `:` 的混合键），
+            //   收紧会误拒真表；本项改进的价值是「把真实数字报出来」，而不是改判据口径。
+            int sample = Math.Min(n, ALIAS_VERIFY_SAMPLE);
+            int shapeOk = 0, shapeBad = 0, outsideLoc = 0, cjkViaChain = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (IsAsciiId(from[i]) && IsAsciiId(to[i])) shapeOk++;
+                else shapeBad++;
+            }
+            for (int s = 0; s < sample; s++)
+            {
+                int i = (int)((long)s * n / sample);
+                string k = from[i];
+                if (!haveLoc) continue;
+                bool inLoc;
+                lock (_locGate) { inLoc = _locNames.ContainsKey(k); }
+                if (!inLoc) outsideLoc++;
+                string tail = AliasChainOf(k, probe, to);
+                string zh;
+                bool hit;
+                lock (_locGate) { hit = _locNames.TryGetValue(tail, out zh) && HasCjk(zh); }
+                if (hit) cjkViaChain++;
+            }
+
+            if (shapeOk * 10 < n * 9)
+            {
+                _aliasIndexFailed = true;
+                note = "形态校验不过（ASCII 标识符 " + shapeOk + "/" + n
+                     + "，非标识符行 " + shapeBad + "），已拒绝（下次启动强制重试）";
+                return false;
+            }
+            if (haveLoc && outsideLoc * 10 < sample * 8)
+            {
+                _aliasIndexFailed = true;
+                note = "与词表区分度不足（不在词表的键 " + outsideLoc + "/" + sample + "），已拒绝";
+                return false;
+            }
+            if (haveLoc && cjkViaChain * 10 < sample * 6)
+            {
+                _aliasIndexFailed = true;
+                note = "交叉校验不过（链尾可解析中文 " + cjkViaChain + "/" + sample + "），已拒绝";
+                return false;
+            }
+
+            lock (_locGate)
+            {
+                _aliasFrom.Clear();
+                _aliasTo.Clear();
+                _aliasIndex.Clear();
+                for (int i = 0; i < n; i++)
+                {
+                    _aliasFrom.Add(from[i]);
+                    _aliasTo.Add(to[i]);
+                    string k = from[i];
+                    if (k != null && k.Length > 0 && !_aliasIndex.ContainsKey(k))
+                        _aliasIndex[k] = i;
+                }
+                _aliasIndexEntries = _aliasIndex.Count;
+            }
+            _aliasIndexBuilt = true;
+            note = "已从缓存导入别名表：" + n + " 行 / " + _aliasIndexEntries + " 键（形态全量 "
+                 + shapeOk + "/" + n + "，非标识符行 " + shapeBad
+                 + (haveLoc ? "；非词表键 " + outsideLoc + "/" + sample + "，链尾含中文 " + cjkViaChain + "/" + sample
+                            : "；词表为空 ⇒ ③④ 跳过（未验证）")
+                 + "）";
+            return true;
+        }
+
+        /// <summary>别名表诊断文本（供日志与报告；**只含偏移与计数，绝不含地址**）。</summary>
+        public string AliasTableDiag { get { return _aliasIndexDiag; } }
+
+        /// <summary>
+        /// 【t29 返工 · R1④ 补验】对**已登记的别名表**（含缓存导入的那种）在**词表就绪时**
+        /// 补做 ③「别名键不在词表」与 ④「链尾能在词表解析出中文」两项抽查 ——
+        /// 导入路径在词表为空时如实跳过了这两项，这里是有机会时的补验。
+        /// 返回诊断文本；**表未就绪或词表为空时返回 null**（调用方据此判断"这次没跑成"，
+        /// 并保留到下次机会，不要把"跳过"当成"通过"）。
+        /// 【t34 · T3 订正】抽查**不过即撤销**：原实现「只把结论追加进
+        /// <see cref="AliasTableDiag"/>、不撤销表」，属评审 t33 finding T3 指出的
+        /// 「读了不用于拒绝」的形式化校验。现在补验结果**参与采用决策** ——
+        /// 不过则清空表 + 置 `_aliasIndexFailed`，消费端立即退回纯词表行为，
+        /// 下次启动强制现场重读（见方法内 `if (!pass)` 分支）。
+        /// </summary>
+        public string VerifyAliasAgainstLocTable()
+        {
+            if (!_aliasIndexBuilt) return null;
+            List<string> frm;
+            List<string> to;
+            lock (_locGate)
+            {
+                if (_locNames.Count == 0) return null;      // 词表未就绪 ⇒ 无法补验
+                if (_aliasFrom.Count == 0 || _aliasFrom.Count != _aliasTo.Count) return null;
+                frm = new List<string>(_aliasFrom);
+                to = new List<string>(_aliasTo);
+            }
+
+            Dictionary<string, int> probe = new Dictionary<string, int>();
+            for (int i = 0; i < frm.Count; i++)
+            {
+                string k = frm[i];
+                if (k == null || k.Length == 0) continue;
+                if (!probe.ContainsKey(k)) probe[k] = i;
+            }
+
+            int n = frm.Count;
+            int sample = Math.Min(n, ALIAS_VERIFY_SAMPLE);
+            if (sample <= 0) return null;
+            int outsideLoc = 0, cjkViaChain = 0;
+            for (int s = 0; s < sample; s++)
+            {
+                int i = (int)((long)s * n / sample);
+                string k = frm[i];
+                bool inLoc;
+                lock (_locGate) { inLoc = _locNames.ContainsKey(k); }
+                if (!inLoc) outsideLoc++;
+                string tail = AliasChainOf(k, probe, to);
+                string zh;
+                bool hit;
+                lock (_locGate) { hit = _locNames.TryGetValue(tail, out zh) && HasCjk(zh); }
+                if (hit) cjkViaChain++;
+            }
+
+            bool pass = (outsideLoc * 10 >= sample * 8) && (cjkViaChain * 10 >= sample * 6);
+            if (!pass)
+            {
+                // 【t34 · T3 修复】补验未通过 ⇒ **真的撤销**已登记的表并置失败态。
+                //   撤销后：① `IsAliasTableReady` 立即变 false ⇒ 消费端（AddByAliasChain 等）
+                //   静默退回纯词表行为；② `_aliasIndexFailed = true` ⇒ 下次启动 `EnsureAliasIndex`
+                //   直接返回失败态，强制走「现场读取 + 四重验证」，绝不把可疑表继续当数据用。
+                //   注意：会话名表（`_itemNames`）里**已并入**的别名单条目不受影响，43 条显示不回退。
+                lock (_locGate)
+                {
+                    _aliasFrom.Clear();
+                    _aliasTo.Clear();
+                    _aliasIndex.Clear();
+                }
+                _aliasIndexEntries = 0;
+                _aliasIndexBuilt = false;
+                _aliasIndexFailed = true;
+            }
+            string msg = "别名表 vs 词表补验：" + (pass ? "通过" : "未通过 ⇒ 已撤销该表并置失败态（下次启动强制现场重读）")
+                       + "（非词表键 " + outsideLoc + "/" + sample
+                       + "，链尾含中文 " + cjkViaChain + "/" + sample + "）";
+            _aliasIndexDiag = _aliasIndexDiag + "；" + msg;
+            return msg;
+        }
+
+        /// <summary>在 LL 实例的字段里找语言 id（形如 "zh_cn" / "en" …）；找不到返回 null。</summary>
+        private string ReadLangIdAt(long llObj)
+        {
+            for (int off = 0x08; off <= 0x200; off += 8)
+            {
+                long p = _mem.ReadLong(llObj + off);
+                if (p <= 0x10000) continue;
+                string v;
+                if (!ReadStringObj(p, out v)) continue;
+                if (v == null || v.Length == 0) continue;
+                for (int i = 0; i < KnownLangIds.Length; i++)
+                    if (v == KnownLangIds[i]) return v;
+            }
+            return null;
+        }
+
+        /// <summary>日志用截断（不输出整串，避免日志过长）。</summary>
+        private static string TruncateForLog(string s, int max)
+        {
+            if (s == null) return "";
+            if (s.Length <= max) return s;
+            return s.Substring(0, max);
         }
 
         /// <summary>
@@ -2176,6 +3041,11 @@ namespace GK2Trainer
 
         private bool IsEntryArrayClass(long vtable)
         {
+            // 【t18 评审 F1】补上 GC 标记位掩码：本方法是全仓**最后一处**直接解引用对象首字
+            // 取 klass 的地方（其余 29 处都经已掩码的 GetClassName / GetClassNameUncached）。
+            // 不掩码**不会造成误判**（fail-safe：首字被标记时这里判 false，只让字典 Entry[] 的
+            // 快路径失效并回退线性扫描），但补上更一致，也避免将来有人把它当成"掩码必须加"的反例。
+            vtable &= GC_MARK_BIT_MASK;
             long klass = _mem.ReadLong(vtable + MONO_VTABLE_KLASS);
             if (klass <= 0x10000 || klass >= 0x7FFFFFFF0000L) return false;
             long namep = _mem.ReadLong(klass + MONO_CLASS_NAME);

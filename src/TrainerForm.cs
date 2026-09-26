@@ -19,7 +19,6 @@ namespace GK2Trainer
         private int _pid;
 
         private Timer _timer;
-        private Label _lblTitle;
         private Label _lblStatus;
         private Button _btnRescan;
         private Button _btnApplyOnce;
@@ -46,7 +45,106 @@ namespace GK2Trainer
         private Button _btnItemApply;
         private Label _lblItemCurCap;
         private Label _lblItemLockCap;
+
+        // ------------------------------------------------------------------
+        // 【2026-09-26 · 方案C 前置】「物品种类修改」三级联动（**本轮只读**）
+        //   框1 = 既有 _cmbItemId（背包中的物品）→ 框2 = 目标种类（全库 814 条 id 聚合）
+        //   → 框3 = 星级 / 属性（所选种类下的全部 id 变体）。
+        //   ⚠ 本区**不含任何写游戏内存的代码**，也没有「更换 / 应用」按钮：
+        //     写入路径另行设计（本轮只把「当前选择最终对应的 id」显示出来供核对）。
+        // ------------------------------------------------------------------
+        /// <summary>框2「目标种类」：分组键 = 中文名 + ItemType 数值（814 条聚合出的种类）。</summary>
+        private ComboBox _cmbKind;
+        /// <summary>框3「星级 / 属性」：所选种类下全部 id 的变体（单 id 种类时置灰）。</summary>
+        private ComboBox _cmbVariant;
+        private Label _lblKindCap;
+        private Label _lblVariantCap;
+        // 【2026-09-26 收尾轮 · 删除】原 `_lblKindPick`（结果回显：当前选择最终对应的**物品 id**，
+        //   形如 cook_vegetable_salad:3）已整体移除 —— 实机 UI 抓取证实它把**内部英文 id**
+        //   （示例：`stick`）直接显示在玩家面前，属"非面向玩家的信息"；而它想表达的"最终会换成什么"
+        //   已由框2（中文名）+ 框3（星级）**完整表达**，保留只会是冗余 + 天书。
+        //   腾出的 121px 宽度转给框3（见 AlignKindRow），星级/红白文本更不容易被截断。
+        /// <summary>
+        /// 【规格更新 2026-09-26】种类行**自己的**「应用」按钮：只写 `Item + 0x10`（id 指针，8 字节）。
+        /// 与数量行的 `_btnItemApply`（只写 `Item + 0x40`，4 字节）**并列且完全独立**：
+        /// 两者各有独立的守卫、判定与提示，不共用任何可变状态（成功/失败标志、输入清空、选中重置）。
+        /// </summary>
+        private Button _btnKindApply;
+        /// <summary>
+        /// 【规格更新 2026-09-26】「应用后自动按 Tab 打开背包」开关（默认勾选）。
+        /// 勾选 ⇒ 种类行写入成功后切前台并连发两次 Tab（见 <see cref="BagRefreshWorker"/>）；
+        /// 未勾选 ⇒ 只写内存，日志提示玩家手动重开背包。
+        /// </summary>
+        private CheckBox _chkAutoRefresh;
+        /// <summary>
+        /// 【置灰可读性】覆盖在 <see cref="_cmbVariant"/> 之上的自绘「面纱」：仅在框3 置灰时可见，
+        /// 用 <see cref="STEAM_TEXT_OFF"/> 在 <see cref="STEAM_INPUT_OFF"/> 上绘制禁用原因
+        /// （6.67:1），绕开「ComboBox 禁用态由系统绘制、ForeColor 不生效」这一深色主题硬坑。
+        /// 框3 本身仍走原生 <c>Enabled=false</c>（键盘 / 鼠标都展不开，语义为真正的不可用）。
+        /// </summary>
+        private Panel _pnlVarVeil;
+        /// <summary>框2 的同款面纱（预热完成前显示「数据未就绪」，避免系统禁用态把框体画成浅灰）。</summary>
+        private Panel _pnlKindVeil;
+        /// <summary>框2 / 框3 的自绘下拉箭头覆盖层（系统按钮区在深色主题下是纯白亮块）。</summary>
+        private Panel _pnlKindArrow;
+        private Panel _pnlVarArrow;
+        /// <summary>【收尾 · 样式统一】框2 / 框3 的自绘文字区覆盖层（与框1 的 `_pnlDropFace` 同规格）。</summary>
+        private SteamFacePanel _pnlKindFace;
+        private SteamFacePanel _pnlVarFace;
+        /// <summary>框2 的全部条目（显示顺序 = 此列表顺序，与 <see cref="_cmbKind"/> 的 Items 一一对应）。</summary>
+        private readonly List<KindEntry> _kinds = new List<KindEntry>();
+        private bool _suppressKind = false;
+        // 【2026-09-26 收尾轮 · 删除】原 `_suppressVar`（抑制框3 重建期间的回显回调）随
+        //   `OnVariantSelectionChanged` / `_lblKindPick` 一并移除：框3 已无 SelectedIndexChanged 订阅者。
+        /// <summary>种类数据版本（类型表/星级表/名表条数）。仅版本变化时才重建框2，避免打断玩家当前选择。</summary>
+        private string _kindDataVersion = "";
+        /// <summary>「星级数据未就绪」提示只输出一次，避免反复重建时刷屏。</summary>
+        private bool _kindStarvedLogged = false;
+        // 【方案A 取证 2026-09-26】框2 覆盖统计：只在数字变化时记一条，避免刷新刷屏
+        private int _kindCoverageIds = -1;
+        private int _kindCoverageNoZh = -1;
+        private int _kindCoverageKinds = -1;
+        private int _kindCoverageAlias = -1;
+        private int _kindCoverageStatAdded = -2;
+        // 【方案A 取证】预热阶段算出的对照数字（供框2 汇总日志一条输出）
+        private int _statAliasAdded = -1;
+        private int _statNameBase = -1;
+        private int _statNameWithAlias = -1;
+        private string _statAliasText = "未建立";
         private readonly Dictionary<string, ItemEntry> _itemNames = new Dictionary<string, ItemEntry>();
+        /// <summary>
+        /// 物品 id → [redSkulls, whiteSkulls]，用于在物品下拉里显示红白骷髅标注，
+        /// 使同名变体可区分（如 `bones_0_0:1` 红0白0 与 `bones_0_1:1` 红0白1 都叫「骨骼（铜星）」）。
+        /// 【2026-09-26】与 `_itemNames` 共用 `_nameGate` 同步门；数据来源为
+        /// `GameResLocator.ItemDefAttrs`（在同一遍堆扫描里顺带读取，字段偏移实测 814/814 = 100% 吻合），
+        /// 并随**独立属性缓存**落盘（`NameCacheStore.TryWriteAttrs` / `TryReadAttrs`），
+        /// 以免「缓存命中」这条常见路径上属性缺失。
+        /// </summary>
+        private readonly Dictionary<string, int[]> _itemAttrs = new Dictionary<string, int[]>();
+
+        /// <summary>
+        /// 物品 id → [quality, qualityType]，用于「物品种类修改」（方案C）的星级菜单判定。
+        /// 【2026-09-26】`qualityType == 0` ⇒ 该物品不分星级（645 条）⇒ 星级菜单必须置灰；
+        /// `== 1` 且该物品名只有一个星级变体（4 个：褐蘑菇、埋葬许可证 I/II/III）⇒ 同样置灰。
+        /// 与 `_itemAttrs` 同源同门（`_nameGate`）；纯数据、与地址无关。
+        /// </summary>
+        private readonly Dictionary<string, int[]> _itemQuality = new Dictionary<string, int[]>();
+
+        /// <summary>
+        /// 物品 id → `ItemType` 枚举**数值**（偏移 +0xCC，实测 814/814）。
+        /// 【2026-09-26 · 方案C】分组键 = **中文名 + ItemType**（用户确认）。
+        /// ⚠ 存的是数值不是名称；显示用名称由 <see cref="ItemTypeName"/> 映射（数值取自反编译源码
+        /// `public enum ItemType`，非推测）。
+        /// </summary>
+        private readonly Dictionary<string, int> _itemType = new Dictionary<string, int>();
+
+        /// <summary>
+        /// 物品 id → ItemDef 实例地址 / id 的 MonoString 指针。**仅供方案C 写入路径使用**
+        /// （复用游戏堆中**已存在**的字符串，避免自行分配 MonoString）。
+        /// ⚠ 地址只存活于本进程内存：**绝不落盘**（红线③），也绝不参与缓存文件读写。
+        /// </summary>
+        private readonly Dictionary<string, long> _itemDefAddr = new Dictionary<string, long>();
+        private readonly Dictionary<string, long> _itemDefIdPtr = new Dictionary<string, long>();
         private List<GameResLocator.ItemRef> _invItems = new List<GameResLocator.ItemRef>();
         private long _selItemAddr = 0;
         private string _selItemId = "";
@@ -60,6 +158,34 @@ namespace GK2Trainer
         private readonly object _nameGate = new object();
         private volatile bool _namesReady = false;
         private volatile bool _warmupRunning = false;
+
+        /// <summary>
+        /// 【t30 · R6④】取证 / 对照代码开关，**默认关闭**。
+        ///   开启方式：设置环境变量 <c>GK2TRAINER_EVIDENCE=1</c> 后启动。
+        ///   开启后才会执行：①「同一函数两遍调用」的对照实验（`IntersectNames(...,loc)` vs
+        ///   `IntersectNames(...,null)`）；②【方案A 实测】长汇总日志；③ 别名链新增示例日志。
+        ///   这些只服务于交付取证，不是产品功能；关闭时零开销（不拼字符串、不做第二遍调用）。
+        /// </summary>
+        private static readonly bool EvidenceMode =
+            (System.Environment.GetEnvironmentVariable("GK2TRAINER_EVIDENCE") == "1");
+
+        /// <summary>
+        /// 【t30 · R1①】UI 侧词表 / 别名表的后台补建是否进行中（防重入）。
+        ///   缓存命中路径原先不建立 UI 侧 `_loc` 的词表与别名表，导致 `LookupNameKeyWithAlias`
+        ///   的别名分支在主路径上不可用（评审 t29 finding R1）。
+        /// </summary>
+        private volatile bool _locBackfillRunning = false;
+
+        /// <summary>
+        /// 【t34 · T1/T2】本次会话的名表是否**来自缓存**（`TryLoadCacheIntoTable` 成功装载）。
+        ///   只有这条路径才允许后台补建 UI 侧词表：缓存命中路径下 `_loc` 缺词表会导致
+        ///   `VerifyAliasAgainstLocTable` 永远跑不成（T2 死结）；而冷启动 / 预热扫描路径的
+        ///   UI 侧 `_loc` 词表并非必需（名表已含全量条目），补建只会白跑一次全堆扫描。
+        /// </summary>
+        private volatile bool _namesFromCache = false;
+        /// <summary>【t29 返工 · R1④】「别名表 vs 词表」补验是否已**真正跑过一次**。
+        /// 用它而不是「别名表已就绪」作守卫 —— 后者会让自检在主路径上永不运行。</summary>
+        private volatile bool _aliasSelfTestDone = false;
         private string _gameFingerprint = null;
         private bool _likesTipShown = false;
         // 物品型功能（科学/science）的背包枚举缓存:数量 >0 时游戏才创建 Item,需要定期补扫
@@ -99,6 +225,13 @@ namespace GK2Trainer
         // 警示橙：Steam 色板为 #F37D07，但它在渐变上部只有 3.6~4.0:1（不达标）；
         // 同色相提亮为 #FFA033 后，渐变顶 4.68:1、渐变底 6.6:1，满足「玩家可见文本 ≥ 4.5:1」。
         private static readonly Color STEAM_WARN = Color.FromArgb(0xFF, 0xA0, 0x33);
+        // 【2026-09-26 · 方案C】禁用态专用色（**绝不用系统禁用色**）：
+        //   WinForms 的系统控件在 Enabled=false 时由系统绘制禁用文字，ForeColor 不生效，
+        //   深色面板上几乎不可见（本项目既有结论，见 t24 SteamCheckBox 注释）。
+        //   故禁用态改为「原生禁用 + 自绘面纱」：底色 #1A1C22 比面板底 #23262E 再暗一档，
+        //   文字 #9AA3AE 对 #1A1C22 的 WCAG 2.1 对比度 = 6.67:1（正文阈值 4.5:1）。
+        private static readonly Color STEAM_INPUT_OFF = Color.FromArgb(0x1A, 0x1C, 0x22);   // 禁用底
+        private static readonly Color STEAM_TEXT_OFF = Color.FromArgb(0x9A, 0xA3, 0xAE);    // 禁用文字（6.67:1）
 
         // 状态栏三种语义色（Steam 的状态文本用中性色，成功态不必高饱和）：
         //   就绪 = STEAM_TEXT（#C6D4DF 中性）· 等待/加载 = STEAM_WAIT（Khaki）· 错误 = STEAM_WARN（警示橙）
@@ -128,8 +261,11 @@ namespace GK2Trainer
 
         /// <summary>功能面板：表头 + 9 行功能 + 操作按钮行。</summary>
         private static readonly Rectangle PANEL_FEATURES = new Rectangle(10, 68, 512, 328);
-        /// <summary>下半区面板：物品数量修改区 + 日志区（同属「读取结果」，共用一块面板，中间一条内部分隔线）。</summary>
-        private static readonly Rectangle PANEL_LOWER = new Rectangle(10, 402, 512, 134);
+        /// <summary>下半区面板：物品数量修改区 + 新增「物品种类修改」行 + 日志区（同属「读取结果」，
+        /// 共用一块面板，中间一条内部分隔线）。
+        /// 【2026-09-26 · 方案C】高度 134 → 168（+34）：面板内新增一行三级联动控件
+        /// （种类 / 星级 / 回显，见 <see cref="AlignKindRow"/>），日志与感谢链接同步下移 34px。</summary>
+        private static readonly Rectangle PANEL_LOWER = new Rectangle(10, 402, 512, 168);
 
         private static System.Drawing.Drawing2D.GraphicsPath RoundedRect(Rectangle r, int radius)
         {
@@ -210,8 +346,11 @@ namespace GK2Trainer
             // ③ 下半区面板内部的分隔线（物品区 ↔ 日志区）：这里上下各有 4px 余量，不会切到控件。
             //    ⚠ 表头下 / 按钮行上**不再画线**：那两处上下只有 1~2px，线会与首尾锁定输入框"融合"
             //    （用户实机反馈），改由面板内留白 + 控件自身边框区分层级。
+            // 【2026-09-26 · 方案C】454 → 488：新增的「种类 / 星级」行（459..485）属**输入区**，
+            //    必须留在分隔线上方；该线始终保持「日志顶 - 4」这一结构关系（旧 454 = 458 - 4，
+            //    新 488 = 492 - 4），位置迁移而非重新设计。
             using (Pen inner = new Pen(STEAM_SEP))
-                e.Graphics.DrawLine(inner, PANEL_LOWER.Left + 6, 454, PANEL_LOWER.Right - 7, 454);
+                e.Graphics.DrawLine(inner, PANEL_LOWER.Left + 6, 488, PANEL_LOWER.Right - 7, 488);
         }
 
         /// <summary>【P0-⑤】上次冷刷新标定出的原子 vtable（同一游戏进程内复用，省一次全堆自举）。</summary>
@@ -283,7 +422,8 @@ namespace GK2Trainer
             }
             catch { }
 
-            Text = "守墓人2 修改器  v1.0   [By:东皇钟]";
+            // 版本号：与 GitHub Release tag 一一对应（v1.1.0 = 2026-09-26：物品种类修改 + 别名表汉化 + 缓存/UI 修复）
+            Text = "守墓人2 修改器  v1.1.0   [By:东皇钟]";
 
             // 【t24 修复 · 窗口被放大导致右下留白】
             // AutoScaleMode = Font 时，OnLoad 会按 AutoScaleFactor = 当前字体度量 / 设计基准
@@ -304,7 +444,12 @@ namespace GK2Trainer
             // 其余控件坐标一律未动，故新增的 46px 全部落在窗口底部、不挤动任何既有控件。
             // 【t37】高度 566 = 532 宽不变；高度随功能区删行收紧 34px（600 → 566），
             // 最底端仍保留一行「Bilibili 感谢链接」（y=538..558，距底边 8px）。
-            ClientSize = new Size(532, 566);
+            // 【2026-09-26 · 方案C】客户区高度由 566 **再加 34** → 600：
+            //   下半区面板高度 134 → 168（PANEL_LOWER），日志 _txtLog.Top 458 → 492（高 68 不变），
+            //   感谢链接 _lnkThanks.Top 538 → 572（572..592，距底边仍 8px），
+            //   面板内分隔线 454 → 488（该线始终 = 日志顶 - 4，结构关系未变），
+            //   物品数量行坐标**未动**（其真实位置由 OnLoad 的 AlignItemRow 按 CY=437 重排）。
+            ClientSize = new Size(532, 600);
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
@@ -444,23 +589,175 @@ namespace GK2Trainer
         }
 
         /// <summary>
-        /// 取客户区纵坐标 y 处的渐变颜色（与 OnPaintBackground 的 0% / 80% / 100% 三段定义一致）。
-        /// 用途：Flat 样式的 CheckBox 会用 BackColor 填充复选框方框，而控件不支持真透明；
-        /// 给它「本行所在位置的渐变同色」后，方框与整行看起来就是透明的 —— 既不会出现
-        /// 白色实心方块（系统默认 ButtonFace），也不会出现深色补丁。
-        /// 渐变在 22px 行高内的色差 &lt; 2 个色阶，肉眼不可见。
+        /// 【2026-09-26 · 方案C】框2 / 框3 的自绘下拉箭头覆盖层。
+        /// 根因与 <see cref="_pnlDropArrow"/> 相同：ComboBox 的按钮区由系统主题绘制，
+        /// 深色主题下是浅色亮块（本轮实机截图实测框2 箭头区为**纯白**），BackColor 压不住。
+        /// 做法：同尺寸自绘 Panel 精确覆盖该区域 —— 底色/边框/箭头全可控；
+        /// 继承 <see cref="WheelForwardPanel"/> ⇒ 滚轮消息原样转发给目标 ComboBox，不丢原生滚轮语义；
+        /// 点击转发为 DroppedDown。**只改绘制，不改任何取值逻辑。**
         /// </summary>
-        private Color SteamGradientAt(int y)
+        private class SteamArrowPanel : WheelForwardPanel
         {
-            int h = ClientSize.Height;
-            if (h <= 0) return STEAM_GRAD_TOP;
-            float p = ((float)y / h) / 0.8f;       // 0%→80% 区间内归一化；80% 之后保持底色
-            if (p < 0f) p = 0f;
-            if (p > 1f) p = 1f;
-            return Color.FromArgb(
-                (int)Math.Round(STEAM_GRAD_TOP.R + (STEAM_GRAD_BOTTOM.R - STEAM_GRAD_TOP.R) * p),
-                (int)Math.Round(STEAM_GRAD_TOP.G + (STEAM_GRAD_BOTTOM.G - STEAM_GRAD_TOP.G) * p),
-                (int)Math.Round(STEAM_GRAD_TOP.B + (STEAM_GRAD_BOTTOM.B - STEAM_GRAD_TOP.B) * p));
+            private readonly ComboBox _combo;
+            private bool _hot = false;
+
+            public SteamArrowPanel(ComboBox target)
+                : base(target)
+            {
+                _combo = target;
+                Width = 24;
+                BackColor = STEAM_PANEL;
+                Cursor = Cursors.Hand;
+                HookComboState(target, new EventHandler(OnComboStateChanged));   // 【T25-1】焦点/展开 → 重绘
+            }
+
+            private void OnComboStateChanged(object sender, EventArgs e) { Invalidate(); }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                bool act = _hot || (_combo != null && (_combo.Focused || _combo.DroppedDown));
+                using (SolidBrush bg = new SolidBrush(act ? STEAM_GRAD_TOP : STEAM_PANEL))
+                    g.FillRectangle(bg, ClientRectangle);
+                using (Pen border = new Pen(act ? STEAM_TEXT_DIM : STEAM_BORDER))
+                    g.DrawRectangle(border, 0, 0, Width - 1, Height - 1);
+                int cx = Width / 2, cy = Height / 2;
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                using (SolidBrush b = new SolidBrush(Color.White))
+                    g.FillPolygon(b, new Point[] {
+                        new Point(cx - 7, cy - 4), new Point(cx + 7, cy - 4), new Point(cx, cy + 6) });
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.Default;
+            }
+
+            protected override void OnMouseEnter(EventArgs e)
+            {
+                _hot = true; Invalidate(); base.OnMouseEnter(e);
+            }
+
+            protected override void OnMouseLeave(EventArgs e)
+            {
+                _hot = false; Invalidate(); base.OnMouseLeave(e);
+            }
+
+            protected override void OnClick(EventArgs e)
+            {
+                if (_combo != null && _combo.Enabled)
+                {
+                    _combo.Focus();
+                    _combo.DroppedDown = true;
+                }
+                base.OnClick(e);
+            }
+        }
+
+        /// <summary>
+        /// 【T25-1 修复】给自绘覆盖层订阅目标 ComboBox 的**焦点 / 展开**四个事件 → 触发重绘。
+        /// 语义与框1 的 `OnDropStateChanged` 完全等价（框1 也订阅这四个事件），
+        /// 差别只在状态量：框1 用 `_dropFaceHot` / `_dropFaceActive`，新框各自用自己的 `_hot` 与
+        /// 实时读取的 `Focused || DroppedDown`，**绝不共用框1 的状态量**。
+        /// 不做这一步的直接后果（t25 实测）：聚焦或展开时 `OnPaint` 根本不会被触发，
+        /// 画面停留在常态色 —— 三框聚焦态取色不一致。
+        /// </summary>
+        private static void HookComboState(ComboBox target, EventHandler h)
+        {
+            if (target == null || h == null) return;
+            target.GotFocus += h;
+            target.LostFocus += h;
+            target.DropDown += h;
+            target.DropDownClosed += h;
+        }
+
+        /// <summary>
+        /// 【收尾 · 样式统一 2026-09-26】框2 / 框3 的自绘「文字区」覆盖层 —— 与框1 的
+        /// <see cref="_pnlDropFace"/> **同规格、同四态语言**。
+        /// 根因（框1 的 t27 已查明）：`DropDownList` 样式的 ComboBox 在「下拉已收起、控件仍持有焦点」时，
+        /// WinForms 会用 `SystemColors.Highlight`(#0078D7) 填满整个客户区，`BackColor`/`ForeColor`/`FlatStyle`
+        /// 全都压不住 —— 深色面板上就是一大块系统蓝。
+        /// 做法：同尺寸自绘 Panel 精确覆盖文字区，原控件退化为纯数据源；
+        /// 继承 <see cref="WheelForwardPanel"/> ⇒ 滚轮消息原样转发，不丢原生滚轮语义；点击转发展开。
+        /// ⚠ hot / 激活状态是**本实例私有**的，绝不与框1 共用（否则悬停一个框会点亮另一个）。
+        /// </summary>
+        private class SteamFacePanel : WheelForwardPanel
+        {
+            private readonly ComboBox _combo;
+            private readonly string _emptyText;
+            private bool _hot = false;
+
+            public SteamFacePanel(ComboBox target, string emptyText)
+                : base(target)
+            {
+                _combo = target;
+                _emptyText = (emptyText == null) ? "" : emptyText;
+                BackColor = STEAM_PANEL;
+                Cursor = Cursors.Hand;
+                if (target != null) target.SelectedIndexChanged += new EventHandler(OnComboChanged);
+                HookComboState(target, new EventHandler(OnComboStateChanged));   // 【T25-1】焦点/展开 → 重绘
+            }
+
+            private void OnComboChanged(object sender, EventArgs e) { Invalidate(); }
+
+            private void OnComboStateChanged(object sender, EventArgs e) { Invalidate(); }
+
+            /// <summary>当前应显示的文本：选中项 ToString()；空列表给占位文本（占位态用次级色）。</summary>
+            public string CurrentText(out bool placeholder)
+            {
+                placeholder = false;
+                string t = "";
+                if (_combo != null)
+                {
+                    object sel = _combo.SelectedItem;
+                    if (sel != null) t = sel.ToString();
+                    else if (_combo.Text != null) t = _combo.Text;
+                }
+                if (t == null) t = "";
+                if (t.Length == 0) { t = _emptyText; placeholder = true; }
+                return t;
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                Graphics g = e.Graphics;
+                // 四态语言与框1 的 `OnDropFacePaint` 逐条一致：
+                //   底色：悬停 = #2A475E，其余 = #23262E
+                //   边框：悬停或激活（聚焦 / 展开中）= #8B929A，其余 = #3D4450
+                bool act = (_combo != null && (_combo.Focused || _combo.DroppedDown));
+                using (SolidBrush bg = new SolidBrush(_hot ? STEAM_GRAD_TOP : STEAM_PANEL))
+                    g.FillRectangle(bg, ClientRectangle);
+                // 左 / 上 / 下三边（右边由箭头按钮的左边框接管，两条边拼成完整矩形，缝处即分隔线）
+                using (Pen b = new Pen((_hot || act) ? STEAM_TEXT_DIM : STEAM_BORDER))
+                {
+                    g.DrawLine(b, 0, 0, Width - 1, 0);
+                    g.DrawLine(b, 0, Height - 1, Width - 1, Height - 1);
+                    g.DrawLine(b, 0, 0, 0, Height - 1);
+                }
+                bool placeholder;
+                string txt = CurrentText(out placeholder);
+                Color fg = placeholder ? STEAM_TEXT_DIM : Color.White;
+                TextRenderer.DrawText(g, txt, this.Font,
+                    new Rectangle(6, 0, Width - 12, Height), fg,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter
+                    | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+            }
+
+            protected override void OnMouseEnter(EventArgs e)
+            {
+                _hot = true; Invalidate(); base.OnMouseEnter(e);
+            }
+
+            protected override void OnMouseLeave(EventArgs e)
+            {
+                _hot = false; Invalidate(); base.OnMouseLeave(e);
+            }
+
+            protected override void OnClick(EventArgs e)
+            {
+                if (_combo != null && _combo.Enabled)
+                {
+                    _combo.Focus();
+                    _combo.DroppedDown = true;
+                }
+                base.OnClick(e);
+            }
         }
 
         /// <summary>把按钮刷成 Steam 面板样式（Flat 深色底 + #3D4450 描边 + 悬停/按下反馈）。</summary>
@@ -483,7 +780,10 @@ namespace GK2Trainer
             // 标题：12pt(16px，落在 Steam 字号阶梯 12/13/14/16 上) + 主文本色 + 分隔线建立层级。
             // 不用高饱和色：深色底上的高饱和亮色会产生光晕(halation)、小字尤甚 ——
             // Steam 的层级一律由「字号 + 字重 + 明度」建立，颜色只承载语义。
-            _lblTitle = MakeLabel("守墓人 2  内存修改器", 16, 8, 400, 28, Color.White, 12f, true);
+            // 【审核轮 2026-09-26】_lblTitle 字段删除（赋值后从不读取）。
+            // 【收尾轮 2026-09-26】连局部变量也一并去掉：MakeLabel 内部已 Controls.Add，
+            //   返回值本就无人读取 —— 留个 `Label lblTitle =` 只是"删了字段但留了个壳"。
+            MakeLabel("守墓人 2  内存修改器", 16, 8, 400, 28, Color.White, 12f, true);
             // 状态栏：Steam 主文本色 #C6D4DF（在渐变顶端 6.4:1；原先的 #AAAAAA 只有 4.19:1，不达标）
             _lblStatus = MakeLabel("正在连接游戏……", 16, 38, 500, STEAM_TEXT, 9f, false);
 
@@ -526,7 +826,19 @@ namespace GK2Trainer
             // 与自动重定位（MonitorLifecycle 每秒校验锚+gameState），无需再让玩家手动刷新。
 
             // ---- 物品数量（Item 层）----
-            MakeLabel("物品数量修改（下拉列表为背包中的物品）", 16, 404, 400, STEAM_TEXT, 9f, true);
+            // 【规格更新 2026-09-26】区块标题「物品数量修改」→「物品修改」：本区现在有两行 ——
+            //   上行改数量（+0x40，4 字节）、下行换种类（+0x10，8 字节指针），各有独立的应用按钮。
+            //   标题右侧放「应用后自动按 Tab 打开背包」开关（默认勾选，样式与功能区的自绘复选框一致）。
+            MakeLabel("物品修改（上行改数量，下行换种类）", 16, 404, 230, STEAM_TEXT, 9f, true);
+
+            _chkAutoRefresh = new SteamCheckBox();
+            _chkAutoRefresh.Text = "应用后自动按 Tab 打开背包";
+            _chkAutoRefresh.Left = 249; _chkAutoRefresh.Top = 404; _chkAutoRefresh.Width = 267;
+            _chkAutoRefresh.Height = 20;
+            _chkAutoRefresh.Checked = true;                 // 默认勾选（抢焦点会打断操作，故给开关）
+            _chkAutoRefresh.BackColor = STEAM_PANEL;        // 方框内部用本行底色填充 ⇒ 视觉上无补丁
+            _chkAutoRefresh.ForeColor = STEAM_TEXT;
+            Controls.Add(_chkAutoRefresh);
 
             // 物品数量修改区：全部控件压在同一行（y≈458）
             // 排列：物品下拉 → 当前数量 → 修改为 → 应用
@@ -606,8 +918,10 @@ namespace GK2Trainer
             // 日志栏：多行 + 自动换行 + 垂直滚动（原为单行覆盖式 500x22，
             // 长句会被硬裁 —— 实测「点赞…卖 1 件商品即可刷新显示」需 843px，只显示得下 500px）。
             // 高度 68px ≈ 3~4 行；客户区高度同步由 530 加到 576，不影响其它控件坐标。
+            // 【2026-09-26 · 方案C】Top 458 → 492（整体下移 34px，高 68 不变）：
+            //   为面板内新增的「种类 / 星级」行（459..485）腾位，行间距仍为 4px（分隔线 488）。
             _txtLog = new TextBox();
-            _txtLog.Left = 16; _txtLog.Top = 458; _txtLog.Width = 500; _txtLog.Height = 68;
+            _txtLog.Left = 16; _txtLog.Top = 492; _txtLog.Width = 500; _txtLog.Height = 68;
             _txtLog.Multiline = true;
             _txtLog.WordWrap = true;
             // 【t25】滚动条同样由系统绘制（白色，深色面板上是第二块亮斑）⇒ 关掉系统滚动条；
@@ -628,7 +942,8 @@ namespace GK2Trainer
             // 悬停提亮为白色并显示下划线，符合链接的可发现性。
             _lnkThanks = new LinkLabel();
             _lnkThanks.Text = "东皇钟@Bilibili  感谢充电支持";
-            _lnkThanks.Left = 16; _lnkThanks.Top = 538; _lnkThanks.Width = 500; _lnkThanks.Height = 20;
+            // 【2026-09-26 · 方案C】Top 538 → 572（随客户区 +34 同步下移；底边 592，距底边仍 8px）
+            _lnkThanks.Left = 16; _lnkThanks.Top = 572; _lnkThanks.Width = 500; _lnkThanks.Height = 20;
             _lnkThanks.Font = new Font("Microsoft YaHei UI", 9f);
             _lnkThanks.BackColor = Color.Transparent;
             _lnkThanks.LinkColor = STEAM_ACCENT;          // #1A9FFF
@@ -639,6 +954,11 @@ namespace GK2Trainer
             _lnkThanks.LinkArea = new LinkArea(0, _lnkThanks.Text.Length);   // 整行可点
             _lnkThanks.LinkClicked += new LinkLabelLinkClickedEventHandler(OnThanksLinkClicked);
             Controls.Add(_lnkThanks);
+
+            // ---- 【2026-09-26 · 方案C 前置】物品种类修改：只读三级联动（框2 / 框3 / 回显）----
+            // 与「物品数量修改」行同一套网格（左 16 / 右 516），纵向落在物品行与日志之间；
+            // 真实坐标由 OnLoad 的 AlignKindRow() 按 CY=472 统一重排。
+            BuildKindRow();
         }
 
         protected override void OnLoad(EventArgs e)
@@ -647,6 +967,7 @@ namespace GK2Trainer
             // 必须在句柄创建之后再对齐：ComboBox 高度由字体决定，
             // 句柄未创建时 Height 只是默认值（远小于实际高度），拿它当基准会把按钮/标签压扁。
             AlignItemRow();
+            AlignKindRow();      // 【方案C】种类 / 星级行的同基准对齐（同样需要句柄已创建）
         }
 
         /// <summary>
@@ -719,6 +1040,882 @@ namespace GK2Trainer
             _txtItemLock.Top = (_pnlItemLock.ClientSize.Height - lineH) / 2;
             if (_txtItemLock.Top < 0) _txtItemLock.Top = 0;
             _btnItemApply.Height = h; _btnItemApply.Top = top;
+        }
+
+        // ==================================================================
+        // 【2026-09-26 · 方案C】「物品种类修改」三级联动 + 种类行写入
+        //
+        //   框1 = _cmbItemId（既有，背包中的物品）—— 行为一字未改，只增加「预置同种类」联动
+        //   框2 = _cmbKind    （目标种类）—— 分组键 = 中文名 + ItemType 数值
+        //   框3 = _cmbVariant （星级 / 属性）—— 所选种类下全部 id 的变体
+        //   按钮 = _btnKindApply（种类行自己的「应用」，只写 Item + 0x10）
+        //   （原「结果回显 _lblKindPick」已于 2026-09-26 收尾轮删除：它显示的是内部英文 id）
+        //
+        //   两个「应用」互不干扰：数量行只写 +0x40（4 字节），种类行只写 +0x10（8 字节）。
+        //   写入成功且读回校验通过后，可选地切前台 + 连发两次 Tab（见 BagRefreshWorker）。
+        //
+        //   覆盖层共三层（自下而上）：ComboBox 本体 → 文字区 SteamFacePanel → SteamArrowPanel
+        //   →（若置灰）面纱 veil 压在最上层。三者都是"只改绘制、不改取值"。
+        //
+        // 数据来源全部是既有只读字典（_itemNames / _itemQuality / _itemType / _itemAttrs），
+        // 读取一律经 _nameGate；字符串拼装在 UI 线程完成（毫秒级，不阻塞、不扫内存）。
+        // ==================================================================
+
+        /// <summary>框2 / 框3 与回显的控件创建（坐标仅占位，真实布局见 <see cref="AlignKindRow"/>）。</summary>
+        private void BuildKindRow()
+        {
+            // ⚠ 标签宽度按**实机实测**的中文 9pt 字宽（TextRenderer.MeasureText：
+            //   「目标种类」= 56px、「星级」= 32px）+ 2px 余量。两轮实机验收抓到的缺陷：
+            //   「目标种类」先后按 48 / 56px 被裁、「星级」按 26 / 30px 被裁成「星」。
+            //   本行还要放下种类行自己的「应用」按钮（58px，与数量行按钮同宽同列），
+            //   故标签取「种类」（34px）：语义由上行标题「物品修改（上行改数量，下行换种类）」交代。
+            _lblKindCap = MakeLabel("种类", 16, 459, 34, STEAM_TEXT, 9f, false);
+
+            _cmbKind = NewDarkCombo(53, 459, 130);
+            _cmbKind.SelectedIndexChanged += new EventHandler(OnKindSelectionChanged);
+            Controls.Add(_cmbKind);
+
+            _lblVariantCap = MakeLabel("星级", 186, 459, 38, STEAM_TEXT, 9f, false);
+
+            _cmbVariant = NewDarkCombo(227, 459, 104);      // 宽度由 AlignKindRow 自适应（此处仅初值）
+            Controls.Add(_cmbVariant);
+
+            // 下拉箭头自绘覆盖层：框2/框3 的按钮区同样由系统主题绘制（实机截图为**纯白亮块**），
+            // 在深色面板上是一块刺眼补丁 ⇒ 与 _pnlDropArrow 同法覆盖（点击转发展开、滚轮原样转发）。
+            _pnlKindArrow = new SteamArrowPanel(_cmbKind);
+            Controls.Add(_pnlKindArrow);
+            _pnlVarArrow = new SteamArrowPanel(_cmbVariant);
+            Controls.Add(_pnlVarArrow);
+
+            // 【收尾 · 样式统一】文字区覆盖层：`DropDownList` 的 ComboBox「已收起但仍持焦点」时会被
+            // 系统用 Highlight(#0078D7) 填满客户区 ⇒ 与框1 的 _pnlDropFace 同规格再盖一层。
+            // 空列表给占位文本（次级色），让「无数据」与「有数据」一眼可分。
+            _pnlKindFace = new SteamFacePanel(_cmbKind, "（未读取到目标种类）");
+            Controls.Add(_pnlKindFace);
+            _pnlVarFace = new SteamFacePanel(_cmbVariant, "（无可用属性）");
+            Controls.Add(_pnlVarFace);
+
+            // 两块禁用「面纱」：框2（数据未就绪）/ 框3（该物品不分星级）。
+            // 均为自绘，底色与文字 100% 可控 —— 杜绝系统禁用态在深色面板上画浅灰底 / 画不可见文字。
+            _pnlKindVeil = NewVeil();
+            _pnlVarVeil = NewVeil();
+
+            // 【2026-09-26 收尾轮】原「结果回显」标签（334..455，显示内部英文 id ）已删除，
+            //   该宽度转给框3（见 AlignKindRow 的动态宽度计算）。
+
+            // 种类行自己的「应用」：只改 id（+0x10），与数量行的按钮互不干扰，右边界与数量行按钮齐平
+            _btnKindApply = new Button();
+            _btnKindApply.Text = "应用";
+            _btnKindApply.Left = 458; _btnKindApply.Top = 459; _btnKindApply.Width = 58; _btnKindApply.Height = 24;
+            ApplySteamButton(_btnKindApply);
+            _btnKindApply.Click += new EventHandler(OnKindApplyClick);
+            Controls.Add(_btnKindApply);
+
+            SetKindBlocked("数据未就绪");
+            SetVariantBlocked("请先选择种类");
+        }
+
+        /// <summary>深色主题只读下拉框（DropDownList + 面板底 + 白字 + Flat）。</summary>
+        private ComboBox NewDarkCombo(int x, int y, int w)
+        {
+            ComboBox c = new ComboBox();
+            c.Left = x; c.Top = y; c.Width = w;
+            c.DropDownStyle = ComboBoxStyle.DropDownList;
+            c.BackColor = STEAM_PANEL;
+            c.ForeColor = Color.White;
+            c.FlatStyle = FlatStyle.Flat;
+            return c;
+        }
+
+        /// <summary>禁用态自绘面纱（覆盖在禁用下拉框之上，保证禁用也能看清文字）。</summary>
+        private Panel NewVeil()
+        {
+            Panel p = new Panel();
+            p.BackColor = STEAM_INPUT_OFF;
+            p.BorderStyle = BorderStyle.None;
+            p.Cursor = Cursors.Default;
+            p.Paint += new PaintEventHandler(OnVeilPaint);
+            p.Visible = false;
+            Controls.Add(p);
+            return p;
+        }
+
+        /// <summary>面纱绘制：更暗的禁用底 + 1px 边框 + #9AA3AE 文字（对底色 6.67:1）。</summary>
+        private void OnVeilPaint(object sender, PaintEventArgs e)
+        {
+            Panel p = sender as Panel;
+            if (p == null) return;
+            using (SolidBrush bg = new SolidBrush(STEAM_INPUT_OFF))
+                e.Graphics.FillRectangle(bg, p.ClientRectangle);
+            using (Pen b = new Pen(STEAM_BORDER))
+                e.Graphics.DrawRectangle(b, 0, 0, p.Width - 1, p.Height - 1);
+            string txt = p.Tag == null ? "" : p.Tag.ToString();
+            TextRenderer.DrawText(e.Graphics, txt, this.Font,
+                new Rectangle(6, 0, p.Width - 12, p.Height), STEAM_TEXT_OFF,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+        }
+
+        /// <summary>
+        /// 种类 / 星级行的统一布局（与 <see cref="AlignItemRow"/> 同一套网格与基准）：
+        ///   左边界 16、右边界 516、间隙 3、控件高度 = 既有 ComboBox 的实际高度、公共中轴 CY = 472。
+        ///   横向分配：种类(34) | 框2(130) | 星级(38) | 框3(自适应，吃掉剩余宽度) | 应用(58) + 4×3 间隙。
+        ///   （2026-09-26 收尾轮：原「回显」格已删除，其宽度转给框3。）
+        ///   右侧「应用」按钮与数量行的 `_btnItemApply` **同宽（58）同右边界（516）**，两行按钮严格同列。
+        /// </summary>
+        private void AlignKindRow()
+        {
+            const int CY = 472;
+            const int GAP = 3;
+            const int LEFT = 16;
+            const int RIGHT = 516;
+            const int BTN_W = 58;        // 与 AlignItemRow 的 _btnItemApply 同宽
+
+            int h = _cmbItemId.Height;
+            if (h < 24) h = 26;
+            int top = CY - h / 2;
+
+            int x = LEFT;
+            _lblKindCap.Left = x; x += _lblKindCap.Width + GAP;
+            _cmbKind.Left = x; x += _cmbKind.Width + GAP;
+            _lblVariantCap.Left = x; x += _lblVariantCap.Width + GAP;
+            // 先钉住右侧按钮（右边界 516），框3 吃掉中间剩余宽度。
+            // 【2026-09-26 收尾轮】原「结果回显」标签占位已删除 ⇒ 框3 由固定 104px 改为自适应
+            //   （实测 227..455 = 228px，约原来 2.2 倍）：星级 / 红白属性文本更不容易被省略号截断。
+            _btnKindApply.Left = RIGHT - BTN_W;
+            _btnKindApply.Width = BTN_W;
+            _cmbVariant.Left = x;
+            _cmbVariant.Width = _btnKindApply.Left - GAP - x;
+            if (_cmbVariant.Width < 104) _cmbVariant.Width = 104;   // 下限 = 原固定宽度
+
+            _lblKindCap.Top = top; _lblKindCap.Height = h;
+            _lblKindCap.TextAlign = ContentAlignment.MiddleLeft;
+            _lblVariantCap.Top = top; _lblVariantCap.Height = h;
+            _lblVariantCap.TextAlign = ContentAlignment.MiddleLeft;
+            _btnKindApply.Top = top; _btnKindApply.Height = h;
+
+            _cmbKind.Top = top;
+            _cmbVariant.Top = top;
+            // z-order（自下而上）：ComboBox 本体 → 文字区 face → 箭头 arrow → 置灰面纱 veil
+            PlaceFace(_pnlKindFace, _cmbKind, _pnlKindArrow, top, h);
+            PlaceFace(_pnlVarFace, _cmbVariant, _pnlVarArrow, top, h);
+            PlaceArrow(_pnlKindArrow, _cmbKind, top, h);
+            PlaceArrow(_pnlVarArrow, _cmbVariant, top, h);
+            PlaceVeil(_pnlKindVeil, _cmbKind, top, h);
+            PlaceVeil(_pnlVarVeil, _cmbVariant, top, h);
+            // 面纱必须在**最上层**（禁用时把 face 与 arrow 一起盖住，不留亮块、不漏字）
+            if (_pnlKindVeil != null && _pnlKindVeil.Visible) _pnlKindVeil.BringToFront();
+            if (_pnlVarVeil != null && _pnlVarVeil.Visible) _pnlVarVeil.BringToFront();
+        }
+
+        /// <summary>
+        /// 把文字区覆盖层对齐到目标下拉框：宽度 = 控件宽 − 箭头宽，右边紧贴箭头的左边框
+        /// （两条边拼成一个完整矩形，缝处即分隔线）——与框1 的 `_pnlDropFace` / `_pnlDropArrow` 同规格。
+        /// </summary>
+        private static void PlaceFace(Panel face, ComboBox target, Panel arrow, int top, int h)
+        {
+            if (face == null || target == null) return;
+            int aw = (arrow == null) ? 24 : arrow.Width;
+            face.Top = top;
+            face.Height = h;
+            face.Left = target.Left;
+            face.Width = target.Width - aw;
+            if (face.Width < 40) face.Width = 40;
+            face.BringToFront();
+            face.Invalidate();
+        }
+
+        /// <summary>把自绘下拉箭头对齐到目标下拉框右端（宽 24，与既有 _pnlDropArrow 同规格）。</summary>
+        private static void PlaceArrow(Panel arrow, ComboBox target, int top, int h)
+        {
+            if (arrow == null || target == null) return;
+            arrow.Top = top;
+            arrow.Height = h;
+            arrow.Left = target.Left + target.Width - arrow.Width;
+            arrow.BringToFront();
+            arrow.Invalidate();
+        }
+
+        /// <summary>把面纱对齐到目标下拉框（同左、同顶、同宽、同高）。</summary>
+        private static void PlaceVeil(Panel veil, ComboBox target, int top, int h)
+        {
+            if (veil == null || target == null) return;
+            veil.Left = target.Left;
+            veil.Top = top;
+            veil.Width = target.Width;
+            veil.Height = h;
+            if (veil.Visible) veil.BringToFront();
+            veil.Invalidate();
+        }
+
+        /// <summary>框2 置灰/解禁（reason 非空即置灰；文字由面纱自绘）。</summary>
+        private void SetKindBlocked(string reason)
+        {
+            if (_cmbKind != null) _cmbKind.Enabled = (reason == null || reason.Length == 0);
+            SetVeil(_pnlKindVeil, reason);
+            InvalidateFaces();
+        }
+
+        /// <summary>框3 置灰/解禁。禁用时仍为原生 Enabled=false（真正展不开），文字由面纱自绘。</summary>
+        private void SetVariantBlocked(string reason)
+        {
+            if (_cmbVariant != null) _cmbVariant.Enabled = (reason == null || reason.Length == 0);
+            SetVeil(_pnlVarVeil, reason);
+            InvalidateFaces();
+        }
+
+        /// <summary>重绘框2/框3 的文字区覆盖层（选中项或列表变化后必须调用，否则文本停留在旧值）。</summary>
+        private void InvalidateFaces()
+        {
+            if (_pnlKindFace != null) _pnlKindFace.Invalidate();
+            if (_pnlVarFace != null) _pnlVarFace.Invalidate();
+        }
+
+        private static void SetVeil(Panel veil, string reason)
+        {
+            if (veil == null) return;
+            bool blocked = (reason != null && reason.Length > 0);
+            veil.Tag = blocked ? reason : null;
+            veil.Visible = blocked;
+            if (blocked) veil.BringToFront();
+            veil.Invalidate();
+        }
+
+        /// <summary>
+        /// 【按需重建】框2 只在**数据版本变化**时重建：版本 = 类型表 / 星级表 / 名表条数。
+        /// 入口是 SetInventory 与 RefillInventoryNames（覆盖热刷新、冷刷新、预热回填、换档），
+        /// 版本未变时直接返回 ⇒ 不会在玩家每次选择时重建框2（那会打断当前选择）。
+        /// </summary>
+        private void EnsureKindList()
+        {
+            if (InvokeRequired) { BeginInvoke(new Action(EnsureKindList)); return; }
+            // 【t30 · R5 订正】原实现把 `_loc.AliasTableCount` 也拼进版本串，理由是「别名表异步就绪时
+            //   NameTableCount 不变 ⇒ 框2 不会重建 ⇒ 43 条补不进去」。该理由**不成立**：
+            //   UI 侧 `_loc` 在缓存命中 / 预热成功路径下原先根本不建别名表（实测恒为 0），
+            //   而 43 条入框2 靠的是 `NameTableCount` 变化（名表缓存本身已含别名单条目）。
+            //   ⇒ 该字段无效、且别名表补建就绪时会带来一次多余重建，已删除。
+            //   若将来确需按别名表状态重建框2，应读**预热线程实例**的状态（需跨实例暴露），
+            //   而不是 UI 侧 `_loc`（后者在缓存命中路径下语义不同）。
+            string v = ItemTypeCount + "/" + ItemQualityCount + "/" + NameTableCount;
+            if (v == _kindDataVersion && _kinds.Count > 0) return;
+            _kindDataVersion = v;
+            RebuildKindList();
+        }
+
+        /// <summary>
+        /// 重建框2「目标种类」。分组键 = **中文名 + ItemType 数值**；显示文本三条规则：
+        ///   ① 默认 = 中文名（不含星级/红白后缀）；
+        ///   ② 同一中文名下 ItemType 多于一个 ⇒ 该中文名的所有条目追加 " · " + ItemTypeName(type)；
+        ///   ③ 组内 id 多于一个、且这些 id 的 ItemSuffix 全同（例如都不分星级且红白均 0）
+        ///      ⇒ 拆成「每 id 一条」并在名称后追加 " (id)"，否则玩家在框2 里无法区分。
+        /// 数据缺失（名字 / 星级 / 类型任一查不到）一律**跳过**该 id：不抛异常、不上屏半成品。
+        /// </summary>
+        private void RebuildKindList()
+        {
+            if (InvokeRequired) { BeginInvoke(new Action(RebuildKindList)); return; }
+
+            // ① 快照：持锁只做一次字典遍历，字符串工作全部在锁外
+            List<string> ids = new List<string>();
+            Dictionary<string, int> types = new Dictionary<string, int>();
+            lock (_nameGate)
+            {
+                foreach (KeyValuePair<string, int> kv in _itemType)
+                {
+                    if (kv.Key == null || kv.Key.Length == 0) continue;
+                    ids.Add(kv.Key);
+                    types[kv.Key] = kv.Value;
+                }
+            }
+            ids.Sort(StringComparer.Ordinal);
+
+            // ② 锁外逐 id 取名 / 后缀 / 星级（DisplayName / ItemSuffix 内部各自加锁）
+            Dictionary<string, KindEntry> acc = new Dictionary<string, KindEntry>();
+            Dictionary<string, HashSet<int>> typesOfName = new Dictionary<string, HashSet<int>>();
+            Dictionary<string, string> suffixOf = new Dictionary<string, string>();
+            int noZhCount = 0;      // 【方案A 取证】走原始 id 兜底的 id 数
+            for (int i = 0; i < ids.Count; i++)
+            {
+                string id = ids[i];
+                int t = types[id];
+                string disp = DisplayName(id);
+                // 【方案A 兜底 2026-09-26】查不到中文名时 DisplayName 会返回**原始 id**：
+                //   旧实现在此 `continue` 跳过 ⇒ 框2 只列有中文名的种类（实测 593 条），
+                //   无中文名的物品**根本无法选作目标**。现在改为**不跳过**、直接用 id 作种类名，
+                //   使框2 覆盖全库。id 兜底项的显示名 = id 本身（唯一），因此各自成组，
+                //   不会与中文名分组混淆；「同名不同 ItemType」「同组多 id 且后缀全同」两条
+                //   既有显示规则保持不变。
+                if (disp == null || disp.Length == 0) continue;
+                if (disp == id) noZhCount++;      // 【方案A 取证】无中文名 ⇒ 走 id 兜底
+                int[] q;
+                lock (_nameGate) { _itemQuality.TryGetValue(id, out q); }
+                if (q == null || q.Length < 2) continue;                        // 星级数据缺失 ⇒ 跳过
+
+                string suf = ItemSuffix(id);
+                string zh = StripSuffix(disp, suf);
+
+                string key = zh + "\u0001" + t.ToString(CultureInfo.InvariantCulture);
+                KindEntry e;
+                if (!acc.TryGetValue(key, out e))
+                {
+                    e = new KindEntry("", zh, t, new List<string>());
+                    acc[key] = e;
+                }
+                e.Ids.Add(id);
+                suffixOf[id] = suf;
+
+                HashSet<int> ts;
+                if (!typesOfName.TryGetValue(zh, out ts))
+                {
+                    ts = new HashSet<int>();
+                    typesOfName[zh] = ts;
+                }
+                ts.Add(t);
+            }
+
+            // ③ 定显示文本（含「后缀全同 ⇒ 按 id 拆分」）
+            List<KindEntry> list = new List<KindEntry>();
+            foreach (KindEntry e in acc.Values)
+            {
+                e.Ids.Sort(StringComparer.Ordinal);
+                string label = e.Base;
+                HashSet<int> ts;
+                if (typesOfName.TryGetValue(e.Base, out ts) && ts.Count > 1)
+                    label = label + " · " + ItemTypeName(e.Type);
+
+                bool sameSuffix = false;
+                if (e.Ids.Count > 1)
+                {
+                    sameSuffix = true;
+                    string first = suffixOf[e.Ids[0]];
+                    for (int i = 1; i < e.Ids.Count; i++)
+                    {
+                        if (suffixOf[e.Ids[i]] != first) { sameSuffix = false; break; }
+                    }
+                }
+
+                if (sameSuffix)
+                {
+                    for (int i = 0; i < e.Ids.Count; i++)
+                    {
+                        List<string> one = new List<string>();
+                        one.Add(e.Ids[i]);
+                        list.Add(new KindEntry(label + " (" + e.Ids[i] + ")", e.Base, e.Type, one));
+                    }
+                }
+                else
+                {
+                    e.Text = label;
+                    list.Add(e);
+                }
+            }
+            list.Sort(CompareKindEntry);
+
+            // ④ 回填（按显示文本保留玩家当前选择）
+            string keep = "";
+            KindEntry cur = _cmbKind.SelectedItem as KindEntry;
+            if (cur != null) keep = cur.Text;
+
+            _kinds.Clear();
+            for (int i = 0; i < list.Count; i++) _kinds.Add(list[i]);
+
+            _suppressKind = true;
+            _cmbKind.BeginUpdate();
+            _cmbKind.Items.Clear();
+            for (int i = 0; i < _kinds.Count; i++) _cmbKind.Items.Add(_kinds[i]);
+            _cmbKind.EndUpdate();
+            int sel = -1;
+            if (keep.Length > 0)
+            {
+                for (int i = 0; i < _kinds.Count; i++)
+                    if (_kinds[i].Text == keep) { sel = i; break; }
+            }
+            _cmbKind.SelectedIndex = sel;
+            _suppressKind = false;
+
+            SetKindBlocked(_kinds.Count > 0 ? null : "数据未就绪");
+            FillVariantList();      // 框2 变了 ⇒ 同步重建框3 与回显
+
+            if (_kinds.Count == 0)
+            {
+                // 只在「三张表都齐了却仍聚合不出条目」时才提示（真异常）。
+                // 预热过程中的中间态（名表未装 / 类型表未填）不再误报噪声日志
+                //（实机两轮都抓到该误报：提示出现在「种类列表已成功建立」之前）。
+                if (!_kindStarvedLogged && _namesReady && NameTableCount > 0
+                    && ItemTypeCount > 0 && ItemQualityCount > 0)
+                {
+                    _kindStarvedLogged = true;
+                    Log("物品种类列表暂时不可用（星级数据尚未读取完成），稍后会自动再读一次。");
+                }
+            }
+            else
+            {
+                _kindStarvedLogged = false;
+            }
+
+            // ---------------- 【t30 · R6④】取证汇总日志（**默认关闭**）----------------
+            // 原实现在每次框2 重建时都拼装一条含全部实测数字的长日志并上屏 —— 属「取证代码进生产」。
+            // 现降为调试开关：只有 GK2TRAINER_EVIDENCE=1 时才会执行（关闭时零开销）。
+            // 日志栏是**单行覆盖式**（见 tools\Watch-TrainerLog.ps1 的说明）：多条连续 Log 会
+            // 互相覆盖 ⇒ 把全部实测数字组装成**一条**输出，只在内容变化时记录一次。
+            if (EvidenceMode && ids.Count > 0)      // 【F3 订正】数据未就绪时不再吐「全库 0 个 id」过早行
+            {
+                int aliasCount = (_loc == null) ? -1 : _loc.AliasTableCount;
+                if (ids.Count != _kindCoverageIds || noZhCount != _kindCoverageNoZh
+                    || _kinds.Count != _kindCoverageKinds || aliasCount != _kindCoverageAlias
+                    || _statAliasAdded != _kindCoverageStatAdded)
+                {
+                    _kindCoverageIds = ids.Count;
+                    _kindCoverageNoZh = noZhCount;
+                    _kindCoverageKinds = _kinds.Count;
+                    _kindCoverageAlias = aliasCount;
+                    _kindCoverageStatAdded = _statAliasAdded;
+
+                    System.Text.StringBuilder sb = new System.Text.StringBuilder();
+                    sb.Append("【方案A 实测】全库 ").Append(ids.Count)
+                      .Append(" 个 id；无中文名 ").Append(noZhCount)
+                      .Append(" 个（按原始 id 兜底）⇒ 框2 条目 ").Append(_kinds.Count);
+                    sb.Append("；别名表 ").Append(_statAliasText);
+                    // 【F3 订正】原先无条件打印对照数字：缓存命中路径下对照实验不跑
+                    //   ⇒ 会吐出「名表 682 条（对照无别名链 -1 条 ⇒ 别名链新增 -1 条）」
+                    //   自相矛盾的一行。现在只在对照确实跑过（≥0）时才打印。
+                    if (_statNameWithAlias >= 0) sb.Append("；名表 ").Append(_statNameWithAlias).Append(" 条");
+                    else sb.Append("；名表 未知");
+                    if (_statNameBase >= 0 && _statAliasAdded >= 0)
+                        sb.Append("（对照无别名链 ").Append(_statNameBase)
+                          .Append(" 条 ⇒ 别名链新增 ").Append(_statAliasAdded).Append(" 条）");
+                    else
+                        sb.Append("（本次路径未跑对照实验 ⇒ 对照数字见报告 §7.3）");
+                    sb.Append("；回归抽样 cabbage:1=").Append(DisplayName("cabbage:1"))
+                      .Append(" / cabbage:2=").Append(DisplayName("cabbage:2"))
+                      .Append(" / bones_1_1:2=").Append(DisplayName("bones_1_1:2"));
+                    // 同名不同 ItemType 的消歧标注：全库只影响「外科医生的失误」6 条
+                    string parts = "";
+                    for (int i = 0; i < _kinds.Count; i++)
+                    {
+                        string tx = _kinds[i].Text;
+                        if (tx == null || tx.IndexOf("外科医生的失误") < 0) continue;
+                        if (parts.Length > 0) parts += " | ";
+                        parts += tx + "=[" + string.Join(",", _kinds[i].Ids.ToArray()) + "]";
+                    }
+                    if (parts.Length == 0) parts = "(未出现)";
+                    sb.Append("；部件条目：").Append(parts);
+                    Log(sb.ToString());
+                }
+            }
+        }
+
+        /// <summary>框2 选中变化 ⇒ 重建框3 + 重算置灰 + 更新回显（**不重建框2**）。</summary>
+        private void OnKindSelectionChanged(object sender, EventArgs e)
+        {
+            if (_suppressKind) return;
+            FillVariantList();
+        }
+
+        /// <summary>
+        /// 重建框3：列出所选种类下**全部 id** 的变体；置灰规则**逐 id 判定**（绝不按中文名判定）：
+        ///   · 该种类只有一个 id 且 qualityType == 0 ⇒ 置灰 +「不分星级」；
+        ///   · 该种类只有一个 id 且 qualityType == 1 ⇒ 置灰 +「只有一种星级」（只有一个选项，展开无意义）；
+        ///   · 该种类多于一个 id ⇒ 框3 可用，列出全部变体。
+        /// </summary>
+        private void FillVariantList()
+        {
+            KindEntry k = (_cmbKind == null) ? null : (_cmbKind.SelectedItem as KindEntry);
+
+            _cmbVariant.BeginUpdate();
+            _cmbVariant.Items.Clear();
+            _cmbVariant.EndUpdate();
+
+            if (k == null)
+            {
+                SetVariantBlocked("请先选择种类");
+                return;
+            }
+
+            if (k.Ids.Count <= 1)
+            {
+                string only = (k.Ids.Count == 1) ? k.Ids[0] : "";
+                // 提示文案取「仅一种星级 / 不分星级」（2026-09-26 起框3 宽 228px，四字绰绰有余）
+                SetVariantBlocked(QualityTypeOf(only) == 1 ? "仅一种星级" : "不分星级");
+                return;
+            }
+
+            List<string> texts = new List<string>();
+            for (int i = 0; i < k.Ids.Count; i++) texts.Add(VariantText(k.Ids[i]));
+            for (int i = 0; i < k.Ids.Count; i++)
+            {
+                string t = texts[i];
+                for (int j = 0; j < k.Ids.Count; j++)      // 兜底：变体文本重复时补 id，保证可区分
+                {
+                    if (j == i) continue;
+                    if (texts[j] == t) { t = t + " (" + k.Ids[i] + ")"; break; }
+                }
+                _cmbVariant.Items.Add(new VariantEntry(k.Ids[i], t));
+            }
+            SetVariantBlocked(null);
+            _cmbVariant.SelectedIndex = 0;
+        }
+
+        /// <summary>框2 + 框3 当前选择对应的目标物品 id（写入判定专用；2026-09-26 起不再上屏）。</summary>
+        private string CurrentKindPickId()
+        {
+            VariantEntry v = (_cmbVariant == null) ? null : (_cmbVariant.SelectedItem as VariantEntry);
+            if (v != null) return v.Id;
+            KindEntry k = (_cmbKind == null) ? null : (_cmbKind.SelectedItem as KindEntry);
+            if (k != null && k.Ids.Count == 1) return k.Ids[0];
+            return "";
+        }
+
+        // ==================================================================
+        // 【规格更新 2026-09-26】种类行写入：只改 Item.id（+0x10，**8 字节指针**）
+        //
+        //   作用对象 = 框1 当前选中的那个 Item（与数量行**同一个对象、不同字段**）：
+        //     数量行 `OnItemApplyClick` → 只写 +0x40（count，4 字节）
+        //     种类行 `OnKindApplyClick` → 只写 +0x10（id 指针，8 字节）
+        //   两个处理器各有独立的守卫、判定、提示与日志，**不共用任何可变状态**。
+        // ==================================================================
+
+        /// <summary>Item 实例快照字节数（B 实测实例大小 0x50 = 80 字节）。</summary>
+        private const int ITEM_SNAPSHOT_BYTES = 0x50;
+
+        /// <summary>
+        /// 种类行「应用」：把框1 选中物品的 id 指针换成框2 + 框3 选中的目标 id 指针。
+        /// ⛔ 只写 +0x10 一个字段。**绝不碰** +0x18（definition）/ +0x20（cachedId）——
+        ///    源码 `ObjectLinkedToDefinition&lt;T&gt;.Definition` 的 getter 以 `cachedId != id` 为失效判据，
+        ///    会自己重查并回填这两处；手工把 cachedId 改成新 id 会**关掉该自愈**、造成「id 新 / 属性旧」。
+        /// ⛔ 也绝不碰 +0x40（count，由数量行按钮独占）。
+        /// </summary>
+        private void OnKindApplyClick(object sender, EventArgs e)
+        {
+            try
+            {
+                if (_loc == null || !_mem.IsOpen) { Log("还没有连接游戏，请先点「刷新」。"); return; }
+                if (_scanBusy) { Log("正在读取游戏数据，请稍候再试。"); return; }
+                if (!CanWrite()) { Log("游戏数据尚未就绪，请稍候或点「刷新」。"); return; }
+
+                if (_selItemAddr == 0 || _selItemId == null || _selItemId.Length == 0)
+                { Log("请先在第一行选中要修改的物品。"); return; }
+
+                string targetId = CurrentKindPickId();
+                if (targetId.Length == 0) { Log("请先选好要换成的种类与星级。"); return; }
+                if (targetId == "empty") { Log("「empty」不是可以换的种类，请另选一个。"); return; }
+                if (targetId == _selItemId) { Log("目标种类与当前物品相同，无需修改。"); return; }
+
+                // 目标指针**只能**取自游戏堆里已存在的 id 字符串；取不到就拒绝（绝不用 0 或旧指针凑）
+                long targetPtr;
+                lock (_nameGate) { _itemDefIdPtr.TryGetValue(targetId, out targetPtr); }
+                if (targetPtr == 0) { Log("暂时拿不到目标物品的数据，请点「刷新」后再试。"); return; }
+
+                string note;
+                if (!SwapItemId(_selItemAddr, targetId, targetPtr, out note))
+                { Log("更换未成功：" + note + "。"); return; }
+
+                // 成功路径**不回滚**（回滚会让玩家的修改白做）。
+                // 日志口径：只说「已修改」；自动刷新由后台线程在真正发键之后再补一条，
+                // **不得**宣称「界面已刷新 / 已生效」（无法确认游戏真的重绘成功）。
+                Log("已把「" + DisplayName(_selItemId) + "」换成「" + DisplayName(targetId) + "」。");
+                if (_chkAutoRefresh != null && _chkAutoRefresh.Checked) StartBagRefresh(_pid);
+                else Log("请手动重开一次背包查看结果。");
+            }
+            catch (Exception ex)
+            {
+                _lastErrorNote = ex.GetType().Name;
+                SaveErrorNote();
+                Log("更换未成功，请重新点「刷新」后再试一次。");
+            }
+        }
+
+        /// <summary>
+        /// 【写入核心】把 <paramref name="itemAddr"/> 的 `Item.id`（+0x10，8 字节指针）换成
+        /// <paramref name="targetIdPtr"/>。步骤严格对齐 E 文档 §4 安全契约：
+        ///   ① 写前 vtable 校验（`GameResLocator.GetClassName` 必须解析出 "Item"）；
+        ///   ② 80 字节整实例快照（回滚用）；
+        ///   ③ **目标指针内容复核**（F2）：`ReadMonoString(targetIdPtr)` 必须 == 目标 id ——
+        ///      写后读回只证明"指针写进去了"，不证明"它指向目标 id"；
+        ///   ④ **只写 8 字节**，且**显式检查**写入 API 返回值（只读句柄上调用写 API 会静默返回 false）；
+        ///   ⑤ 写后复读必须等于目标指针，否则**立即回滚**并逐字节校验回滚结果；
+        ///   ⑥ 写后**重读 +0x00** 与写前快照里的 vtable 比对（T22-5）：不一致 ⇒ 对象已被移动/回收
+        ///      ⇒ 回滚 + 报失败（绝不静默成功）；
+        ///   ⑦ 顺带确认 +0x40（count）一个字节都没变（证明两行按钮互不干扰）。
+        /// 全程不构造任何 MonoString；除"回滚写回 80 字节快照"外，绝不写 +0x18 / +0x20 / +0x40。
+        /// </summary>
+        private bool SwapItemId(long itemAddr, string targetId, long targetIdPtr, out string note)
+        {
+            note = "";
+            if (itemAddr == 0 || targetIdPtr == 0) { note = "地址无效"; return false; }
+
+            // ① 写前：vtable → 类名必须是 Item（对象未被回收 / 未被移动）
+            long vt = _mem.ReadLong(itemAddr);
+            if (vt == 0 || _loc.GetClassName(vt) != "Item")
+            { note = "该物品的对象已经变化，请点「刷新」后再试"; return false; }
+
+            // ② 80 字节整实例快照 + 写前读一次 +0x10
+            byte[] snap = _mem.ReadBytes(itemAddr, ITEM_SNAPSHOT_BYTES);
+            if (snap == null || snap.Length < ITEM_SNAPSHOT_BYTES) { note = "读取物品数据失败"; return false; }
+            long oldPtr = BitConverter.ToInt64(snap, GameResLocator.ITEM_ITEMID);
+            int oldCount = BitConverter.ToInt32(snap, GameResLocator.ITEM_COUNT);
+
+            // ③ 目标指针内容复核（F2）：指针不该被盲信 —— 读它指向的 MonoString 看是不是目标 id。
+            //    不相等 ⇒ 指针已失效/被别的内容占用 ⇒ 拒绝写入（绝不用它去覆盖玩家物品的 id）。
+            if (targetId != null && targetId.Length > 0)
+            {
+                string atPtr = _loc.ReadMonoString(targetIdPtr);
+                if (atPtr == null || atPtr != targetId)
+                { note = "目标物品的数据不可信（指针指向的不是该物品），请点「刷新」后再试"; return false; }
+            }
+
+            // ④ 只写 8 字节；写入 API 的返回值必须为真（否则是"看起来成功其实没写"）
+            if (!_mem.WriteBytes(itemAddr + GameResLocator.ITEM_ITEMID,
+                                 BitConverter.GetBytes(targetIdPtr)))
+            { note = "写入被拒绝（可能没有写权限），请以管理员身份重开本工具后再试"; return false; }
+
+            // ⑤ 写后复读：必须等于目标指针；不等 ⇒ 立即回滚
+            long back = _mem.ReadLong(itemAddr + GameResLocator.ITEM_ITEMID);
+            if (back != targetIdPtr)
+            {
+                string rb = RollbackItem(itemAddr, snap);
+                note = "写后校验不一致（读回值不是目标物品）," + rb;
+                return false;
+            }
+
+            // ⑥ 写后重读 +0x00，与写前快照里的 vtable 比对（T22-5）：
+            //    E §4 契约第 2 条要求"写入前后各读一次 +0x00 比对" —— 不一致说明对象已被移动/回收，
+            //    此时即便 +0x10 读回等于目标指针也不能算成功（我们可能写在了旧地址上）⇒ 回滚 + 报失败。
+            if (_mem.ReadLong(itemAddr) != BitConverter.ToInt64(snap, 0))
+            {
+                string rbV = RollbackItem(itemAddr, snap);
+                note = "写入后该物品的对象已变化（vtable 不同）," + rbV;
+                return false;
+            }
+
+            // ⑦ 数量字段（+0x40，4 字节）必须一个字节都没动 —— 两行按钮互不干扰的自证
+            if (_mem.ReadInt(itemAddr + GameResLocator.ITEM_COUNT) != oldCount)
+            {
+                string rb2 = RollbackItem(itemAddr, snap);
+                note = "数量字段被意外改动," + rb2;
+                return false;
+            }
+
+            if (oldPtr == targetIdPtr) note = "目标与当前相同";   // 理论上已被调用方拦掉
+            return true;
+        }
+
+        /// <summary>
+        /// 回滚：把 80 字节快照整体写回，然后逐字节复读校验。
+        /// 允许 +0x18..+0x27（definition / cachedId）在此期间被游戏 getter 自愈改掉
+        /// ——那两处**本来就会**随 `cachedId != id` 失效判据自动重查，其余字节必须与快照完全一致。
+        /// </summary>
+        private string RollbackItem(long itemAddr, byte[] snap)
+        {
+            if (!_mem.WriteBytes(itemAddr, snap)) return "回滚失败，请重开背包确认物品状态";
+            byte[] after = _mem.ReadBytes(itemAddr, ITEM_SNAPSHOT_BYTES);
+            if (after == null || after.Length < snap.Length) return "回滚后无法复读，请重开背包确认物品状态";
+            int diff = 0;
+            bool onlySelfHeal = true;
+            for (int i = 0; i < snap.Length; i++)
+            {
+                if (after[i] == snap[i]) continue;
+                diff++;
+                if (i < 0x18 || i > 0x27) onlySelfHeal = false;
+            }
+            if (diff == 0) return "已回滚（80 字节与写前快照逐字节一致）";
+            if (onlySelfHeal) return "已回滚（仅 definition/cachedId 被游戏自愈改动）";
+            return "回滚后校验不一致，请重开背包确认物品状态";
+        }
+
+        // ------------------------------------------------------------------
+        // 【规格更新 2026-09-26】写入成功后的自动刷新：切前台 + 连发两次 Tab
+        //   ⚠ 只在「写入成功且读回校验通过」之后调用；任何失败路径都不发按键。
+        //   ⚠ 全程在后台线程：合计约 0.8~1.0 s 的等待，绝不能阻塞 UI 线程。
+        // ------------------------------------------------------------------
+
+        /// <summary>Win32 模拟输入出口（只用于「打开背包」这一个动作，不发送任何其它按键）。</summary>
+        private static class Input32
+        {
+            public const int SW_RESTORE = 9;
+            public const byte VK_TAB = 0x09;
+            public const uint KEYEVENTF_KEYUP = 0x0002;
+
+            [System.Runtime.InteropServices.DllImport("user32.dll")]
+            public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+            [System.Runtime.InteropServices.DllImport("user32.dll")]
+            public static extern bool SetForegroundWindow(IntPtr hWnd);
+            // 用 keybd_event 而不是 SendKeys：SendKeys 发给前台窗口、且从非 UI 线程调用有已知坑
+            [System.Runtime.InteropServices.DllImport("user32.dll")]
+            public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+        }
+
+        private void StartBagRefresh(int pid)
+        {
+            if (pid <= 0) { Log("未能自动切换窗口，请手动按 Tab 打开背包查看结果。"); return; }
+            System.Threading.Thread t = new System.Threading.Thread(
+                new System.Threading.ThreadStart(delegate { BagRefreshWorker(pid); }));
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        /// <summary>
+        /// 后台线程：把游戏窗口切到前台并按两次 Tab。**两次**的理由（必须保留）：
+        /// 背包**若本来是打开的**，第一次 Tab 是「关闭」——关闭动作不会触发 `UIItemCell.Draw`，
+        /// 也就不会走 `Definition` getter 自愈；第二次 Tab 才是「打开」，必定触发一次绘制。
+        /// 两次可保证**无论初始开 / 关都至少发生一次「打开」**，且结束时停在打开状态，玩家正好看到结果。
+        /// </summary>
+        private void BagRefreshWorker(int pid)
+        {
+            string fail = "";
+            try
+            {
+                System.Diagnostics.Process proc = System.Diagnostics.Process.GetProcessById(pid);
+                proc.Refresh();
+                IntPtr h = proc.MainWindowHandle;
+                if (h == IntPtr.Zero)
+                {
+                    fail = "未能自动切换窗口，请手动按 Tab 打开背包查看结果。";
+                }
+                else
+                {
+                    Input32.ShowWindow(h, Input32.SW_RESTORE);
+                    Input32.SetForegroundWindow(h);
+                    System.Threading.Thread.Sleep(180);      // 等前台切换生效
+                    Input32.keybd_event(Input32.VK_TAB, 0, 0, UIntPtr.Zero);
+                    Input32.keybd_event(Input32.VK_TAB, 0, Input32.KEYEVENTF_KEYUP, UIntPtr.Zero);
+                    System.Threading.Thread.Sleep(350);
+                    Input32.keybd_event(Input32.VK_TAB, 0, 0, UIntPtr.Zero);
+                    Input32.keybd_event(Input32.VK_TAB, 0, Input32.KEYEVENTF_KEYUP, UIntPtr.Zero);
+                }
+            }
+            catch (Exception ex)
+            {
+                _lastErrorNote = ex.GetType().Name;
+                fail = "未能自动切换窗口，请手动按 Tab 打开背包查看结果。";
+            }
+            LogAsync(fail.Length > 0 ? fail : "已发送 Tab 打开背包。");
+        }
+
+        /// <summary>后台线程写日志：切回 UI 线程；句柄未就绪时静默丢弃（不影响写入结果）。</summary>
+        private void LogAsync(string msg)
+        {
+            try
+            {
+                if (InvokeRequired) { BeginInvoke(new Action<string>(LogAsync), new object[] { msg }); return; }
+                Log(msg);
+            }
+            catch (Exception)
+            {
+                // 窗口已关闭等边缘情况：丢弃这条提示即可
+            }
+        }
+
+
+        /// <summary>
+        /// 框1（背包物品）选中变化 ⇒ 把框2「目标种类」预置为**同一种类**（同中文名 + 同 ItemType），
+        /// 方便玩家「同种类换星级」。定位不到时**不预置、不报错** —— 预置纯属便利功能，
+        /// 任何异常都不得影响既有的物品数量修改逻辑。
+        /// </summary>
+        private void PresetKindForItem(string id)
+        {
+            try
+            {
+                if (_cmbKind == null || _kinds.Count == 0) return;
+                if (id == null || id.Length == 0) return;
+                int t;
+                if (!TryGetItemType(id, out t)) return;
+                string disp = DisplayName(id);
+                if (disp == null || disp.Length == 0 || disp == id) return;
+                string zh = StripSuffix(disp, ItemSuffix(id));
+                for (int i = 0; i < _kinds.Count; i++)
+                {
+                    if (_kinds[i].Type != t || _kinds[i].Base != zh) continue;
+                    if (_cmbKind.SelectedIndex == i) FillVariantList();
+                    else _cmbKind.SelectedIndex = i;
+                    return;
+                }
+            }
+            catch (Exception)
+            {
+                // 预置失败：静默（不弹框、不打断既有选择逻辑）
+            }
+        }
+
+        /// <summary>纯中文名：把 <see cref="DisplayName"/> 的结果剥掉 <see cref="ItemSuffix"/>。</summary>
+        private static string StripSuffix(string disp, string suf)
+        {
+            if (suf == null || suf.Length == 0) return disp;
+            if (disp.Length > suf.Length && disp.EndsWith(suf, StringComparison.Ordinal))
+                return disp.Substring(0, disp.Length - suf.Length);
+            return disp;
+        }
+
+        /// <summary>
+        /// 框3 每项文本：星级词 + 红白（红白均 0 时不显示红白，与 <see cref="ItemSuffix"/> 同口径）。
+        /// 星级取自 <c>_itemQuality</c> 的 [quality, qualityType] **运行时字段**，不是解析 id；
+        /// 无星级 ⇒「无星级」；未知数值不猜测，原样标注。
+        /// </summary>
+        private string VariantText(string id)
+        {
+            int[] q;
+            lock (_nameGate) { _itemQuality.TryGetValue(id, out q); }
+            string star = "无星级";
+            if (q != null && q.Length >= 2 && q[1] == 1)
+            {
+                if (q[0] == 1) star = "铜星";
+                else if (q[0] == 2) star = "银星";
+                else if (q[0] == 3) star = "金星";
+                else star = "星级" + q[0].ToString(CultureInfo.InvariantCulture);
+            }
+            string skull = SkullText(id);
+            if (skull.Length == 0) return star;
+            return star + " " + skull;
+        }
+
+        /// <summary>取该 id 的 qualityType（0 = 不分星级 / 1 = 有星级）；数据缺失按 0 处理。</summary>
+        private int QualityTypeOf(string id)
+        {
+            if (id == null || id.Length == 0) return 0;
+            int[] q;
+            lock (_nameGate) { _itemQuality.TryGetValue(id, out q); }
+            if (q == null || q.Length < 2) return 0;
+            return q[1];
+        }
+
+        /// <summary>取该 id 的 ItemType 数值（加锁读）；查不到返回 false。</summary>
+        private bool TryGetItemType(string id, out int t)
+        {
+            t = 0;
+            if (id == null || id.Length == 0) return false;
+            lock (_nameGate) { return _itemType.TryGetValue(id, out t); }
+        }
+
+        /// <summary>框2 排序：先按显示文本（默认中文比较），文本相同再按组内首个 id（序数序）保证稳定。</summary>
+        private static int CompareKindEntry(KindEntry a, KindEntry b)
+        {
+            int c = string.Compare(a.Text, b.Text, StringComparison.CurrentCulture);
+            if (c != 0) return c;
+            string x = (a.Ids.Count > 0) ? a.Ids[0] : "";
+            string y = (b.Ids.Count > 0) ? b.Ids[0] : "";
+            return string.CompareOrdinal(x, y);
+        }
+
+        /// <summary>框2 条目：一个「种类」= 一个 (中文名 + ItemType) 分组（必要时按 id 拆分，见 RebuildKindList）。</summary>
+        private class KindEntry
+        {
+            public string Text;         // 上屏文本
+            public string Base;         // 纯中文名（无星级/红白后缀、无类型与 id 标注）——框1→框2 预置时比对
+            public int Type;            // ItemType 数值
+            public List<string> Ids;    // 组内 id（升序）
+            public KindEntry(string text, string baseName, int type, List<string> ids)
+            {
+                Text = text; Base = baseName; Type = type; Ids = ids;
+            }
+            public override string ToString() { return Text; }
+        }
+
+        /// <summary>框3 条目：一个物品 id + 它的变体文本（星级 / 红白）。</summary>
+        private class VariantEntry
+        {
+            public string Id;
+            public string Display;
+            public VariantEntry(string id, string display) { Id = id; Display = display; }
+            public override string ToString() { return Display; }
         }
 
         private void BuildFeatures()
@@ -810,6 +2007,16 @@ namespace GK2Trainer
         /// （普通结果型日志仍走 Log() 去重，见下。）
         /// </summary>
         private void LogEvent(string s) { LogCore(s, true); }
+
+        /// <summary>
+        /// 【2026-09-26 收尾轮】取证类日志：**只在证据模式（<c>GK2TRAINER_EVIDENCE=1</c>）下上屏**。
+        /// 背景：日志栏是**玩家可见**区域，但历史多轮为排障陆续新增的「别名表 / 词表 / 缓存校验 /
+        /// 内部自检 PASS」一类明细直接走了 <see cref="Log(string)"/> —— 实机抓取到一次启动 7 行日志里
+        /// 3 行是内部取证（最长一行 100+ 字符），违反 t4 确立的「界面与日志一律玩家语言」纪律。
+        /// 故统一收敛到本出口：默认不上屏（玩家看不到），排障时开同一个既有开关即可全部复现。
+        /// 关闭时字符串拼接仍会发生（代价为一次启动几十次短拼接，可忽略），但**不写日志栏、不占 30 行缓冲**。
+        /// </summary>
+        private void EvidenceLog(string s) { if (EvidenceMode) Log(s); }
 
         private void LogCore(string s, bool bypassDedup)
         {
@@ -928,9 +2135,15 @@ namespace GK2Trainer
                     if (pidChanged) _atomVTableHint = 0;
                     _loc = new GameResLocator(_mem, _atomVTableHint);
                 }
+                // 【t30 · R1①】`_loc` 可能晚于预热线程建立（缓存命中路径下预热先返回）
+                //   ⇒ 这里再挂一次补建。幂等：已在建 / 别名表已就绪时立即返回，不重复扫描。
+                if (_namesReady) StartLocAliasBackfill();
 
-                // ---------------- 【热路径】锚有效 **且资源组已选定** → 不做任何全堆扫描 ----------------
-                // 只按缓存地址重读数值（微秒级）；地址失效（换档/重载）时往下走冷路径。
+                // ---------------- 【热路径】锚可复用 **且资源组已选定** → 不做任何全堆扫描 ----------------
+                // 只按缓存地址重读数值（微秒级）；不可复用时往下走冷路径**重新解析**。
+                // 【P0a 语义边界】IsAnchorStillValid() = 身份 ∧ 结构，此处用作**复用前的廉价校验**：
+                //   两者都成立才敢直接复用缓存（结构不可读时复用会读到不可信数据）；
+                //   失败后果是冷路径重新解析，**不是**换档重载 —— 换档判定在 MonitorLifecycle ②′。
                 // 【t19 修正】资源组未选定时**直接重新定位** —— 这是用户「点刷新即可自救」的
                 // 唯一路径：旧版只看锚是否有效，锚一通就永远走热路径，选组再也不执行。
                 bool anchorValid = !processChanged && _loc.IsAnchorStillValid();
@@ -1344,15 +2557,20 @@ namespace GK2Trainer
             _invItems = items;
 
             string keep = _selItemId;
+            long keepAddr = _selItemAddr;      // 【必修缺陷修复】优先按地址保留选中（同 id 多件时才分得清）
             _suppressSel = true;
             _cmbItemId.BeginUpdate();
             _cmbItemId.Items.Clear();
+            int keepIdx = -1, keepIdxById = -1;
             for (int i = 0; i < items.Count; i++)
             {
                 string d = DisplayName(items[i].ItemId) + " × " + items[i].Count;
-                _cmbItemId.Items.Add(new InvEntry(items[i].ItemId, d));
-                if (keep.Length > 0 && items[i].ItemId == keep) _cmbItemId.SelectedIndex = i;
+                _cmbItemId.Items.Add(new InvEntry(items[i].ItemId, d, items[i].Address));
+                if (keepAddr != 0 && items[i].Address == keepAddr) keepIdx = i;
+                else if (keep.Length > 0 && items[i].ItemId == keep && keepIdxById < 0) keepIdxById = i;
             }
+            if (keepIdx >= 0) _cmbItemId.SelectedIndex = keepIdx;
+            else if (keepIdxById >= 0) _cmbItemId.SelectedIndex = keepIdxById;
             _cmbItemId.EndUpdate();
             if (_cmbItemId.SelectedIndex < 0 && items.Count > 0) _cmbItemId.SelectedIndex = 0;
             _suppressSel = false;
@@ -1361,6 +2579,9 @@ namespace GK2Trainer
             // 不再在此单独点亮 —— 那是「状态未就绪却能点应用」的旁路来源（t3 R-5/D-8）。
             RefreshFeatureAvailability();
             OnItemSelectionChanged(null, null);
+            // 【方案C】种类/星级是**全库**数据，与本次背包内容无关；但「刷新 / 换档 / 预热回填」
+            // 都会经过这里 ⇒ 挂在此处可覆盖全部数据到齐的时机（版本未变时零成本返回）。
+            EnsureKindList();
         }
 
         /// <summary>下拉选中项变化：刷新「当前数量」显示。</summary>
@@ -1448,10 +2669,15 @@ namespace GK2Trainer
             using (Pen border = new Pen(act ? STEAM_TEXT_DIM : STEAM_BORDER))
                 e.Graphics.DrawRectangle(border, 0, 0, p.Width - 1, p.Height - 1);
             int cx = p.Width / 2, cy = p.Height / 2;
+            // 【T25-4 修复】保存旧的 SmoothingMode 并在绘制结束后恢复：原实现只设不还原，
+            // 会污染同一个 Graphics 上后续的绘制（本文件其它自绘都做了保存/恢复）。
+            // 只改绘图状态管理，绘制内容与观感一字不变。
+            System.Drawing.Drawing2D.SmoothingMode old = e.Graphics.SmoothingMode;
             e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
             using (SolidBrush b = new SolidBrush(Color.White))
                 e.Graphics.FillPolygon(b, new Point[] {
                     new Point(cx - 7, cy - 4), new Point(cx + 7, cy - 4), new Point(cx, cy + 6) });
+            e.Graphics.SmoothingMode = old;
         }
 
         /// <summary>箭头区悬停：与主体共用同一个悬停态（整块一起提亮）。</summary>
@@ -1492,16 +2718,27 @@ namespace GK2Trainer
             InvEntry sel = _cmbItemId.SelectedItem as InvEntry;
             if (sel == null) { _selItemId = ""; _selItemAddr = 0; _lblItemCurrent.Text = "-"; return; }
             _selItemId = sel.Id;
-            GameResLocator.ItemRef r = FindInvItem(sel.Id);
+            // 【方案C】把「目标种类」预置为当前物品所属的同一种类（同中文名 + 同 ItemType）；
+            // 定位不到时不预置、不报错。纯附加联动，不影响下面任何既有取值逻辑。
+            PresetKindForItem(sel.Id);
+            GameResLocator.ItemRef r = FindInvItemByAddr(sel.Address);
             if (r == null) { _selItemAddr = 0; _lblItemCurrent.Text = "-"; return; }
             _selItemAddr = r.Address;
             _lblItemCurrent.Text = r.Count.ToString();
         }
 
-        private GameResLocator.ItemRef FindInvItem(string id)
+        /// <summary>
+        /// 按 **Item 实例地址** 在本次背包枚举结果里取回条目。
+        /// 【必修缺陷修复 2026-09-26】旧实现 `FindInvItem(string id)` 按 id 查、**恒定返回第一件**，
+        /// 背包里有同 id 多件（如两格木板）时作用对象会错 —— D 轮实测：选「木板×22」改到了「木板×30」。
+        /// 地址才是这一格的身份；地址随下拉项 <see cref="InvEntry.Address"/> 一起来自同一次枚举。
+        /// ⚠ 地址只在本进程内有效，不落盘、不上屏。
+        /// </summary>
+        private GameResLocator.ItemRef FindInvItemByAddr(long addr)
         {
+            if (addr == 0) return null;
             for (int i = 0; i < _invItems.Count; i++)
-                if (_invItems[i].ItemId == id) return _invItems[i];
+                if (_invItems[i].Address == addr) return _invItems[i];
             return null;
         }
 
@@ -1512,11 +2749,19 @@ namespace GK2Trainer
         //   （按项目既有约定不列名，原文见 backup_src_t5\TrainerForm.cs）
 
         /// <summary>下拉项：显示「中文名 × 数量」（Id 仍是英文物品 ID，仅内部使用，不上屏）。</summary>
+        /// <remarks>
+        /// 【必修缺陷修复 2026-09-26】新增 <see cref="Address"/>：背包里可能有**多件同 id 物品**
+        /// （例如两格「木板」，数量分别是 22 与 30）。旧实现一律用 `FindInvItem(id)` 按 id 查，
+        /// **恒定返回第一件** ⇒ 玩家选「木板×22」，实际被改的是「木板×30」（D 轮实测复现）。
+        /// Item 的**实例地址**才是这一格的身份，id 不是。
+        /// 地址随 <see cref="SetInventory"/> 重建下拉项而同步更新，本字段不落盘、不上屏。
+        /// </remarks>
         private class InvEntry
         {
             public string Id;
             public string Display;
-            public InvEntry(string id, string display) { Id = id; Display = display; }
+            public long Address;
+            public InvEntry(string id, string display, long address) { Id = id; Display = display; Address = address; }
             public override string ToString() { return Display; }
         }
 
@@ -1658,18 +2903,274 @@ namespace GK2Trainer
             return added;
         }
 
-        /// <summary>词表 ∩ 物品 id 全集 = 物品名表（精简掉 UI / 任务 / 对话等非物品键）。</summary>
-        private static Dictionary<string, string> IntersectNames(Dictionary<string, string> whole, List<string> itemIds)
+        /// <summary>
+        /// 把 id → [redSkulls, whiteSkulls] 装入属性表（已有的不覆盖），返回新增条数。
+        /// 【2026-09-26】与 `LoadNamesIntoTable` 并列，供「预热扫描」与「属性缓存命中」两条路径复用。
+        /// </summary>
+        private int LoadAttrsIntoTable(IDictionary<string, int[]> attrs)
+        {
+            if (attrs == null || attrs.Count == 0) return 0;
+            int added = 0;
+            lock (_nameGate)
+            {
+                foreach (KeyValuePair<string, int[]> kv in attrs)
+                {
+                    if (kv.Key == null || kv.Key.Length == 0) continue;
+                    if (kv.Value == null || kv.Value.Length < 2) continue;
+                    if (_itemAttrs.ContainsKey(kv.Key)) continue;
+                    _itemAttrs[kv.Key] = kv.Value;
+                    added++;
+                }
+            }
+            return added;
+        }
+
+        /// <summary>属性表条数（加锁读；用于判断是否需要补扫）。</summary>
+        private int ItemAttrCount
+        {
+            get { lock (_nameGate) { return _itemAttrs.Count; } }
+        }
+
+        /// <summary>
+        /// 把 id → [quality, qualityType] 装入星级表（已有的不覆盖），返回新增条数。
+        /// 【2026-09-26 · 方案C 前置】与 <see cref="LoadAttrsIntoTable"/> 并列、同门。
+        /// </summary>
+        private int LoadQualityIntoTable(IDictionary<string, int[]> quals)
+        {
+            if (quals == null || quals.Count == 0) return 0;
+            int added = 0;
+            lock (_nameGate)
+            {
+                foreach (KeyValuePair<string, int[]> kv in quals)
+                {
+                    if (kv.Key == null || kv.Key.Length == 0) continue;
+                    if (kv.Value == null || kv.Value.Length < 2) continue;
+                    if (_itemQuality.ContainsKey(kv.Key)) continue;
+                    _itemQuality[kv.Key] = kv.Value;
+                    added++;
+                }
+            }
+            return added;
+        }
+
+        /// <summary>星级表条数（加锁读）。</summary>
+        private int ItemQualityCount
+        {
+            get { lock (_nameGate) { return _itemQuality.Count; } }
+        }
+
+        /// <summary>
+        /// 把 id → ItemType 数值装入类型表（已有的不覆盖），返回新增条数。
+        /// 【2026-09-26 · 方案C】与 <see cref="LoadQualityIntoTable"/> 并列、同门。
+        /// </summary>
+        private int LoadTypeIntoTable(IDictionary<string, int> types)
+        {
+            if (types == null || types.Count == 0) return 0;
+            int added = 0;
+            lock (_nameGate)
+            {
+                foreach (KeyValuePair<string, int> kv in types)
+                {
+                    if (kv.Key == null || kv.Key.Length == 0) continue;
+                    if (_itemType.ContainsKey(kv.Key)) continue;
+                    _itemType[kv.Key] = kv.Value;
+                    added++;
+                }
+            }
+            return added;
+        }
+
+        /// <summary>类型表条数（加锁读）。</summary>
+        private int ItemTypeCount
+        {
+            get { lock (_nameGate) { return _itemType.Count; } }
+        }
+
+        /// <summary>
+        /// 【方案C】ItemType 数值 → **界面辅助标签**（中文）。
+        /// ⚠ 这些中文是**本工具自定的显示标签**，不是游戏本地化原文（游戏内 ItemType 不直接上屏）——
+        /// 仅用于在「中文名 + 类型」分组键里把同名不同类的条目区分开（全库只影响「外科医生的失误」6 条）。
+        /// 数值 → 名称的对应关系取自反编译源码 `public enum ItemType`（None=0 … Bag=400、Demon=666），
+        /// 属**静态确定**；中文标签本身属**工程约定**，不得宣称与游戏等价。
+        /// </summary>
+        private static string ItemTypeName(int t)
+        {
+            switch (t)
+            {
+                case 0: return "无类型";
+                case 1: return "斧";
+                case 2: return "铲";
+                case 3: return "镐";
+                case 4: return "锤";
+                case 5: return "钓竿";
+                case 10: return "手";
+                case 11: return "剑";
+                case 12: return "护甲";
+                case 13: return "脑";
+                case 14: return "心";
+                case 15: return "血肉";
+                case 16: return "骨";
+                case 18: return "鱼饵";
+                case 20: return "布道";
+                case 22: return "弓";
+                case 23: return "手术器具";
+                case 24: return "试剂";
+                case 25: return "小工具";
+                case 26: return "书";
+                case 27: return "护符";
+                case 28: return "烤肉";
+                case 30: return "防腐";
+                case 35: return "头骨";
+                case 36: return "内脏";
+                case 37: return "皮肤";
+                case 45: return "项圈";
+                case 50: return "长矛";
+                case 400: return "背包";
+                case 666: return "恶魔";
+                default: return "类型" + t;
+            }
+        }
+
+        /// <summary>ItemDef 地址表条数（加锁读）。地址表为空 ⇒ 方案C 写入路径不可用，需现场补扫。</summary>
+        private int ItemDefAddrCount
+        {
+            get { lock (_nameGate) { return _itemDefAddr.Count; } }
+        }
+
+        /// <summary>
+        /// 【方案C 前置】从一次已完成的 `FindAllItemDefIds` 现场把**地址表**搬进本窗体。
+        /// ⚠ 纯进程内拷贝：调用方须保证同一次进程会话；**这些值绝不写任何缓存文件**（红线③）。
+        /// 每次整表重建时整体替换（不是"已有的不覆盖"）—— 地址随重扫变化，旧地址必须丢弃。
+        /// </summary>
+        private void LoadItemDefAddrFrom(GameResLocator loc)
+        {
+            if (loc == null) return;
+            lock (_nameGate)
+            {
+                _itemDefAddr.Clear();
+                _itemDefIdPtr.Clear();
+                foreach (KeyValuePair<string, long> kv in loc.ItemDefInstAddr)
+                {
+                    if (kv.Key == null || kv.Key.Length == 0) continue;
+                    _itemDefAddr[kv.Key] = kv.Value;
+                }
+                foreach (KeyValuePair<string, long> kv in loc.ItemDefIdPtr)
+                {
+                    if (kv.Key == null || kv.Key.Length == 0) continue;
+                    _itemDefIdPtr[kv.Key] = kv.Value;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 【2026-09-26】只补扫红白骷髅属性（**不扫词表**）：名表缓存命中、但属性缓存缺失时调用。
+        /// 实测 `FindAllItemDefIds` 只枚举 ItemDef 实例（词表提取是另一个方法），成本远低于整表提取。
+        /// 失败一律静默 —— 没有属性只是少一个标注，界面照常可用。
+        /// </summary>
+        private void TryFillAttrsOnly(int pid, string fp)
+        {
+            try
+            {
+                ProcessMemory mem = new ProcessMemory();
+                if (!mem.Open(pid)) return;
+                try
+                {
+                    GameResLocator loc = new GameResLocator(mem);
+                    loc.FindAllItemDefIds();                        // 只为填充 loc.ItemDefAttrs
+                    // 【2026-09-26 · 方案C 前置】星级与地址表同一遍扫描顺带产出，一并搬回
+                    // （即使红白属性为空也照搬：星级菜单的置灰判定不依赖红白）。
+                    LoadQualityIntoTable(new Dictionary<string, int[]>(loc.ItemDefQuality));
+                    LoadTypeIntoTable(new Dictionary<string, int>(loc.ItemDefType));
+                    LoadItemDefAddrFrom(loc);
+                    Dictionary<string, int[]> attrs = new Dictionary<string, int[]>(loc.ItemDefAttrs);
+                    if (attrs.Count == 0) return;
+                    LoadAttrsIntoTable(attrs);
+                    string note;
+                    NameCacheStore.TryWriteAttrs(fp, attrs, out note);   // 下次启动即可命中属性缓存
+                }
+                finally { mem.Close(); }
+            }
+            catch (Exception ex) { _lastErrorNote = ex.GetType().Name; }
+        }
+
+        /// <summary>把候选键（若在词表中且尚未入表）加入名表；供 IntersectNames 复用。</summary>
+        private static void AddNameCandidate(Dictionary<string, string> t, Dictionary<string, string> whole, string key)
+        {
+            if (t == null || whole == null || key == null || key.Length == 0) return;
+            if (t.ContainsKey(key)) return;
+            string zh;
+            if (whole.TryGetValue(key, out zh) && zh != null && zh.Length > 0) t[key] = zh;
+        }
+
+        /// <summary>
+        /// 词表 ∩ 物品 id 全集 = 物品名表（精简掉 UI / 任务 / 对话等非物品键）。
+        /// 【2026-09-26 补】星级变体的**备用键**也必须入表：
+        ///   游戏 `ItemDef.GetHeader()` 对 qualityType==Star 的物品先查完整 id，
+        ///   查不到则回退 `id.Split(':')[0]`；而游戏中文词表里几乎没有 ":N" 键
+        ///   （9387 条中仅 9 条含冒号）—— 也就是说**备用键才是词表里真实存在的那一条**，
+        ///   而备用键本身不是任何 ItemDef 的 id，旧实现只做精确匹配 ⇒ 被交集过滤掉，
+        ///   星级物品在缓存路径下永远查不到中文名（用户报告的「未汉化」）。
+        ///   备用键的选取依据是游戏**原始本地化资源** lng_zh_cn 的 aliases1/aliases2 别名表
+        ///   （8697 条，从 resources.assets 提取，见 evidence\loc_lng_zh_cn_aliases.csv）：
+        ///       bones_1_1:2 -> bones      skull_0_2:2 -> skull     heart_1_1:1 -> heart
+        ///       brain_0_2:2 -> brain      guts_1_0:1  -> guts      skin_0_0:1  -> skin_1_1
+        ///   三类候选键与别名表在 814 个 ItemDef 上逐条比对结果见 coverage_report.txt。
+        /// 【2026-09-26 · P3 删除】原在此另有两条**超出游戏规则**的候选键：基名再取第一个下划线
+        ///   段（`bones_1_1:2` → `bones`）与 `该段 + "_1_1"`。这两条是本工具自创的猜测型规则
+        ///   （游戏 `GetHeader()` 只回退到 `id.Split(':')[0]`），复算证明：别名表就绪时它们
+        ///   一条也接不住（命中 0），仅在别名表不可用的退化会话里接住 36 条人体部件星级变体 ——
+        ///   而"可能猜对几个、可能静默猜错"的代价不值这个收益 ⇒ 一并删除，见 P3 报告。
+        /// </summary>
+        private static Dictionary<string, string> IntersectNames(Dictionary<string, string> whole, List<string> itemIds,
+                                                                 GameResLocator loc)
         {
             Dictionary<string, string> t = new Dictionary<string, string>();
             if (whole == null || itemIds == null) return t;
             for (int i = 0; i < itemIds.Count; i++)
             {
+                string id = itemIds[i];
                 string zh;
-                if (whole.TryGetValue(itemIds[i], out zh) && zh != null && zh.Length > 0)
-                    t[itemIds[i]] = zh;
+                if (whole.TryGetValue(id, out zh) && zh != null && zh.Length > 0)
+                    t[id] = zh;
+                else
+                    AddByAliasChain(t, whole, loc, id);        // 【方案A】别名表跟链
+
+                // 星级变体（形如 "xxx:N"）的备用键一并入表
+                int colon = id.IndexOf(':');
+                if (colon > 0)
+                {
+                    string baseId = id.Substring(0, colon);
+                    AddNameCandidate(t, whole, baseId);                       // xxx_0_0
+                    AddByAliasChain(t, whole, loc, baseId);                   // 【方案A】基名也走别名链
+                }
             }
             return t;
+        }
+
+        /// <summary>
+        /// 【方案A】把 key 经**运行时别名表**跟链后的结果并入名表：
+        ///   tail = 别名链尾（无别名命中时 == key）；tail 在中文词表里 ⇒ t[key] = whole[tail]。
+        /// 语义与游戏 <c>LLBase.L(key)</c> 一致（别名优先、跟链到不动点、命中即不再查原键）。
+        /// 【t30 · R3 订正】原注释断言「实测『别名键 100% 不在词表』」——**不准确**。
+        /// 独立复算（`evidence\verify_t27\recompute_t27.txt`）得 8697 条中**有 1 条例外**：
+        /// `38_village_mailbox_certificate`（词表值「领取村长证明。」vs 别名链尾「深入森林」）。
+        /// 当前**无任何 ItemDef 的链尾指向它**（该键本身也不在 814 全集内、未写入名表）
+        /// ⇒ 对 814 个物品的影响为 **0**。
+        /// ⚠ 但这意味着「直查优先 ⇔ 别名优先」的等价性**并非无条件**（依赖数据巧合）：
+        /// 若未来某个 id 的别名链尾落在这类「同时在词表」的键上，两条路径会给出不同显示 ——
+        /// **届时必须重新评估直查优先的等价性**（必要时改为严格按 `LLBase.L` 的别名优先）。
+        /// loc 为空 / 别名表未建立时静默跳过（回退到接入前的行为）。
+        /// </summary>
+        private static void AddByAliasChain(Dictionary<string, string> t, Dictionary<string, string> whole,
+                                            GameResLocator loc, string key)
+        {
+            if (t == null || whole == null || loc == null || key == null || key.Length == 0) return;
+            if (t.ContainsKey(key)) return;
+            if (!loc.IsAliasTableReady) return;
+            string tail = loc.ResolveAliasChain(key);
+            if (tail == null || tail.Length == 0 || tail == key) return;
+            string zh;
+            if (whole.TryGetValue(tail, out zh) && zh != null && zh.Length > 0) t[key] = zh;
         }
 
         /// <summary>
@@ -1722,7 +3223,67 @@ namespace GK2Trainer
             if (!NameCacheStore.TryRead(fingerprint, out table, out note)) return false;
             if (note == null) return false;
             if (table.Count < NameCacheStore.MinEntries) return false;
+
+            // 【t34 · T1 修复】**名表缓存不得被 UI 实例的建立时序否决**。
+            //   原实现在「名表已读出、条数已过检」之后才写 `if (_loc == null) return false;`
+            //   ⇒ 连名表缓存一起废掉：`StartWarmup()` 必然早于 `_loc` 的创建（在 `LocateWorker` 里），
+            //   于是预热线程每次都走现场全扫（词表 + 别名表 ≈ 8~9 s + `IntersectNames`），
+            //   暖启动由「缓存命中 5 s 内」退化到 17.02 s（评审 t33 finding T1，high）。
+            //   名表缓存的可信度由 `NameCacheStore.TryRead` 内的**本文件自洽校验**（标识 / 类型 /
+            //   指纹 / 语言 / 条数下限 / 声明与实际条数一致）**独立保证**，与 `_loc` 何时建立无关。
+            //   【2026-09-26 · P2】原注释写的是"由 `alias=` 门限独立保证" —— 该字段与门限已删除，
+            //   判据改为上列各项（取消的只是跨文件互验，不是"不校验"）。
+            //   别名表 import 改为「`_loc != null` 时执行，否则交给 `StartLocAliasBackfill`」
+            //   （后台补 import + 建词表，见 `LocAliasBackfillWorker`；import 毫秒级、建词表 ≈4 s，
+            //   全程不阻塞 UI）。
+            if (_loc != null)
+            {
+                List<string> aliasFrom, aliasTo;
+                string aliasNote, cacheVerify;
+                // 【2026-09-26 · P2】原先把名表缓存头的 `alias=` 作**交叉基准**传入，用于检出
+                //   「正文截短 + count 同步改小」的残缺表。该字段与判据均已取消（用户裁决：
+                //   持久缓存各自自洽）⇒ 这里不再多读一次名表缓存。**已知边界**：自洽残缺表
+                //   不再被检出（预期降级）；缓解手段 = 任何拒绝都能靠 P1 的写回通路自愈。
+                if (!NameCacheStore.TryReadAlias(fingerprint,
+                        out aliasFrom, out aliasTo, out cacheVerify, out aliasNote))
+                {
+                    EvidenceLog("别名表缓存不可用（" + aliasNote + "），本次改为现场重建名表与别名表。");
+                    return false;
+                }
+                string importNote;
+                if (!_loc.TryImportAliasTable(aliasFrom, aliasTo, out importNote))
+                {
+                    EvidenceLog("别名表缓存内容校验未过（" + importNote + "），本次改为现场重建名表与别名表。");
+                    return false;
+                }
+                // importNote 必须**可见**：它含「词表为空 ⇒ 后两项跳过（未验证）」这一关键状态
+                //   （缓存命中路径下 `_loc` 没有词表，③④ 确实没验）。缓存自带的 verify 字段
+                //   也一并输出，避免"这张表到底验没验过"变成不可观测。
+                // 【2026-09-26 收尾轮】"可见" = **证据模式下可见**（EvidenceLog）：该行是纯内部明细
+                //   （别名表行数 / 词表状态 / 验证标记），玩家读不懂，不再占用玩家日志栏。
+                EvidenceLog("别名表 " + importNote + "；缓存来源验证="
+                    + (cacheVerify == null || cacheVerify.Length == 0 ? "未标注" : cacheVerify));
+                // 【R1④ 解耦】导入成功即尝试补验（词表若已就绪就真的跑；未就绪则留给下次机会）
+                RunAliasVerificationOnce(_loc, "缓存命中导入后");
+            }
+            else
+            {
+                // `_loc` 尚未建立（预热线程早于 `LocateWorker`）：**名表照常装载**（见下），
+                //   别名表 import 与词表建立留给 `_loc` 建立后的 `StartLocAliasBackfill`。
+            }
+
             LoadNamesIntoTable(table);
+            // 【t34 · T1/T2】标记「名表来自缓存」：这是**唯一**允许后台补建 UI 侧词表的路径
+            //   （T2 的死结由此解开），冷启动 / 预热扫描路径不做无谓重扫。
+            _namesFromCache = true;
+            // 【2026-09-26】顺带装载红白骷髅属性（**独立**缓存文件）。
+            // 缺失不影响名表可用性 —— 只是这条路径上暂时没有红白标注，界面照常可用。
+            Dictionary<string, int[]> attrs;
+            string anote;
+            if (NameCacheStore.TryReadAttrs(fingerprint, out attrs, out anote) && attrs != null)
+                LoadAttrsIntoTable(attrs);
+            // 【F3 订正】缓存路径也要给出名表条数（原实现留给汇总日志一个 -1，日志自相矛盾）
+            _statNameWithAlias = NameTableCount;
             _namesReady = true;
             return true;
         }
@@ -1735,6 +3296,10 @@ namespace GK2Trainer
         private void RefillInventoryNames()
         {
             if (InvokeRequired) { BeginInvoke(new Action(RefillInventoryNames)); return; }
+            // 【方案C】框2/框3 的数据源是**全库 814 条**（与背包无关）⇒ 必须在「背包为空就早退」
+            // 之前按需重建；否则未进档 / 背包为空时种类列表永远不会出现。
+            // EnsureKindList 自带版本判重：数据没变时只是一次字符串比较，不会打断玩家选择。
+            EnsureKindList();
             if (_invItems == null || _invItems.Count == 0) return;
             SetInventory(_invItems);
         }
@@ -1791,6 +3356,19 @@ namespace GK2Trainer
                 // ① 缓存可用：毫秒级装载
                 if (TryLoadCacheIntoTable(fp))
                 {
+                    // 【2026-09-26】属性缓存缺失时的补扫：名表缓存是**持久**的（老版本就写过），
+                    // 而属性缓存是本次新引入的独立文件 ⇒ 首次启用时「名表命中、属性为空」，
+                    // 若不补扫，下拉会一直没有红白标注（实测首次启动即如此）。
+                    // 补扫只枚举 ItemDef（不扫词表），成本远低于整表提取。
+                    // 【2026-09-26 · 方案C】补扫条件加上「星级表空」与「地址表空」：
+                    //   星级表可由属性缓存之外的路径补齐，但**地址表永不落盘**（红线③）
+                    //   ⇒ 每次缓存命中路径都必须现场重扫一遍才能拿到 ItemDef 实例地址。
+                    if (ItemAttrCount == 0 || ItemQualityCount == 0 || ItemTypeCount == 0 || ItemDefAddrCount == 0)
+                        TryFillAttrsOnly(pid, fp);
+                    // 【t30 · R1①】缓存命中路径同样要建立 UI 侧词表 + 别名表（后台线程、不阻塞 UI）：
+                    //   否则 `LookupNameKeyWithAlias` 的别名分支在**主路径**上是死代码（评审 t29 R1）；
+                    //   补建完成后会做一次一致性自检（R1④）与「名表缺条 ⇒ 别名链补齐并重写缓存」的自愈（R1③）。
+                    StartLocAliasBackfill();
                     SetStatus("物品名称已加载完成。", STEAM_TEXT);
                     RefillInventoryNames();
                     return;
@@ -1805,24 +3383,98 @@ namespace GK2Trainer
                     GameResLocator loc = new GameResLocator(mem);
                     List<string> defIds = loc.FindAllItemDefIds();
                     loc.PrefetchLocalizedNames(new List<string>());
+                    // 【方案A】词表建立后并列建立运行时别名表；失败则 IsAliasTableReady=false，
+                    //   后续 IntersectNames 静默退回接入前的行为（不影响可用性）。
+                    // 【t30 · R6④】别名表状态日志 + 对照实验降为调试开关（默认关闭）：
+                    //   原实现为生成对照数字**常驻**执行第二遍 IntersectNames(...,null) 并上屏两条日志，
+                    //   属「取证代码进生产」。开启方式：GK2TRAINER_EVIDENCE=1。
                     Dictionary<string, string> whole = new Dictionary<string, string>();
                     loc.CopyLocalizedNames(whole);
-                    Dictionary<string, string> itemTable = IntersectNames(whole, defIds);
+                    Dictionary<string, string> itemTable = IntersectNames(whole, defIds, loc);
 
-                    if (itemTable.Count < NameCacheStore.MinEntries)
+                    if (EvidenceMode)
                     {
+                        Log("别名表状态：" + loc.AliasTableStatus);
+                        // 【方案A 对照实验】同一函数、同一输入，**唯一差异是 loc 是否为 null**：
+                        //   loc = null ⇒ 接入前行为（无别名链）；loc = 真实 ⇒ 接入后行为。
+                        //   两者条数差 = 别名链真正新增的条目数（不引用任何离线 CSV，运行时自证）。
+                        Dictionary<string, string> baseTable = IntersectNames(whole, defIds, null);
+                        int aliasAdded = itemTable.Count - baseTable.Count;
+                        string aliasText = loc.IsAliasTableReady
+                            ? (loc.AliasTableCount + " 条") : ("不可用（" + loc.AliasTableStatus + "）");
+                        _statAliasText = aliasText;
+                        _statNameBase = baseTable.Count;
+                        _statNameWithAlias = itemTable.Count;
+                        _statAliasAdded = aliasAdded;
+                        Log("别名表 " + aliasText + "；名表 " + itemTable.Count
+                            + " 条（对照：无别名链 " + baseTable.Count + " 条 ⇒ 别名链新增 "
+                            + aliasAdded + " 条）");
+                        if (aliasAdded > 0)
+                        {
+                            List<string> gained = new List<string>();
+                            foreach (KeyValuePair<string, string> kv in itemTable)
+                            {
+                                if (gained.Count >= 8) break;
+                                if (!baseTable.ContainsKey(kv.Key)) gained.Add(kv.Key);
+                            }
+                            Log("别名链新增示例：" + string.Join(", ", gained.ToArray()));
+                        }
+                    }
+
+                    if (itemTable.Count < NameCacheStore.MinEntries)                    {
                         // 【t3 C-1】把「静默失效」变成可见提示：诊断在 loc.Diagnostics 里
-                        Log("物品名称暂时读取不足，稍后会自动再读一次。");
+                        Log("物品名称还没读全，稍后会自动再试一次。");
                         return;
                     }
 
-                    string wrNote;
-                    if (!NameCacheStore.TryWrite(fp, itemTable, out wrNote))
+                    // 【P1 修复 2026-09-26】无论写缓存成功与否都必须装载名表。
+                    // 原实现只在 TryWrite **失败**时装载 ⇒ 写成功时（正是「缓存失效后首次启动」
+                    // 的真实场景）名表只留在局部变量、_namesReady 保持 false，而 UI 线程侧的
+                    // _loc 是另一个实例且 TryGetLocalizedName 不触发扫描 ⇒ 本会话内下拉列表
+                    // 全程显示原始 id，必须手动点一次「刷新」才恢复。
+                    // 由 t4 独立验证判定为必修缺陷（02_分析记录\_星级与读档机制_20260926\
+                    // t4_独立验证_汉化修复_20260926.md）。
+                    // 【t29 返工 · 别名表落盘】把现场建好的别名表导出：
+                    //   ① 写**独立**别名表缓存（纯数据 + 游戏指纹 + 独立表结构版本号）；
+                    //   ② 共享给 UI 侧 `_loc`（让 DisplayName 的别名链与下一会话的缓存命中路径都能用上）。
+                    List<string> aliasFrom, aliasTo;
+                    // 【2026-09-26 · P2】该局部量**只**用于界面统计 `_statAliasText`（现场行数）。
+                    //   原先它还作为 `TryWrite` 的 `aliasEntries` 实参写进名表缓存头（`alias=`），
+                    //   该形参与字段已删除 ⇒ 这里不再跨文件传递。
+                    int aliasEntries = 0;
+                    if (loc.TryExportAliasTable(out aliasFrom, out aliasTo))
                     {
-                        // 缓存写不进去（目录不可写等）→ 表留在内存，刷新仍然不必重扫
-                        LoadNamesIntoTable(itemTable);
-                        _namesReady = true;
+                        aliasEntries = aliasFrom.Count;
+                        string awNote;
+                        // 现场建表时词表必然已在内存 ⇒ 四重验证已含 ③④ ⇒ 缓存标注 loc-checked
+                        NameCacheStore.TryWriteAlias(fp, aliasFrom, aliasTo,
+                                                     loc.LocalizedNameCount > 0, out awNote);
+                        if (_loc != null)
+                        {
+                            string aiNote;
+                            if (_loc.TryImportAliasTable(aliasFrom, aliasTo, out aiNote))
+                                EvidenceLog("别名表 " + aiNote);
+                        }
+                        // 【R1④ 解耦】冷启动路径同样尝试一次补验（用有词表的 loc，必然能跑成）
+                        RunAliasVerificationOnce(loc, "冷启动现场建表后");
                     }
+                    if (_statNameWithAlias < 0) _statNameWithAlias = itemTable.Count;
+                    _statAliasText = aliasEntries + " 条（现场）";
+
+                    string wrNote;
+                    NameCacheStore.TryWrite(fp, itemTable, out wrNote);   // 写失败不影响本会话可用性
+                    LoadNamesIntoTable(itemTable);
+                    // 【2026-09-26】红白骷髅属性：与 id 列表在**同一遍堆扫描**里顺带读到（零额外扫描成本），
+                    // 装入内存表，并写**独立**属性缓存供后续会话的「缓存命中」路径使用。
+                    Dictionary<string, int[]> attrs = new Dictionary<string, int[]>(loc.ItemDefAttrs);
+                    LoadAttrsIntoTable(attrs);
+                    // 【2026-09-26 · 方案C 前置】星级表 + 地址表（地址只在本进程内存，不落盘）
+                    LoadQualityIntoTable(new Dictionary<string, int[]>(loc.ItemDefQuality));
+                    LoadTypeIntoTable(new Dictionary<string, int>(loc.ItemDefType));
+                    LoadItemDefAddrFrom(loc);
+                    string anAttrNote;
+                    NameCacheStore.TryWriteAttrs(fp, attrs, out anAttrNote);
+                    _namesReady = true;
                     SetStatus("物品名称已加载完成。", STEAM_TEXT);
                     RefillInventoryNames();     // 【P0-②】把中文名推上界面
                 }
@@ -1831,7 +3483,11 @@ namespace GK2Trainer
             catch (Exception ex)
             {
                 // 【t3 C-1】预热异常不再静默（旧版空 catch 会让「整表提取失效」完全无痕）
-                Log("物品名称读取失败（" + ex.GetType().Name + "），已先使用物品编号显示。");
+                // 【2026-09-26 收尾轮】玩家可见文案去掉**异常类型名**（英文类名对玩家无意义，
+                //   已由 SaveErrorNote 落在会话目录 last_error.txt 供排障）；玩家只需知道后果与去向。
+                _lastErrorNote = ex.GetType().Name;
+                SaveErrorNote();
+                Log("物品名称暂时没能读取，先用物品编号显示；稍后会自动再试一次。");
             }
             finally
             {
@@ -1839,37 +3495,423 @@ namespace GK2Trainer
             }
         }
 
+        // ==================================================================
+        // 【t30 R1①③④ + t34 T1/T2】UI 侧词表 / 别名表：后台补建 + 名表自愈 + 一致性自检
+        //
+        // 背景（评审 t29 finding R1）：缓存命中路径下名表由缓存装载 ⇒
+        //   ① `LookupNameKeyWithAlias` 的别名分支在**主路径**上曾是死代码；
+        //   ② 若某次扫描会话别名表建表失败，会写出一张「缺 43 条、Magic 相同」的名表缓存，
+        //      此后每次启动都命中它且**无自愈路径**。
+        // 当前实现（含 t34 订正）：
+        //   · `TryLoadCacheIntoTable`：`_loc` 已建立 ⇒ **直接 import 别名表缓存**（毫秒级）；
+        //     `_loc` 未建立 ⇒ 只装名表并 `return true`，**不得否决名表缓存**（T1）；
+        //     两条分支都会置 `_namesFromCache`；
+        //   · `_loc` 建立后由 `LocAliasBackfillWorker` 补 import（若尚未）+ 建**词表**（≈4 s），
+        //     判据是「**词表**未就绪」而不是「别名表已就绪」一票否决（T2：解开自检/自愈死结）；
+        //   · 词表就绪后做一次**自愈**（补名表缺条并重写缓存）与**两次自检**
+        //     （「别名表 vs 词表」补验 + 「名表直查 vs 别名链」一致性）。
+        // ==================================================================
+
+        /// <summary>
+        /// 【t29 返工 · R1④ 解耦】两条路径（冷启动现场建表 / 缓存命中导入）**各**尝试一次
+        /// 「别名表 vs 词表」补验，并顺势跑一次 t30 的「名表直查 vs 别名链」一致性自检。
+        /// 守卫用 <c>_aliasSelfTestDone</c> 而**不是** <c>AliasTableCount &gt; 0</c> ——
+        /// 原实现挂在 LocAliasBackfillWorker 上，被「别名表已就绪就跳过」挡住，
+        /// 以致缓存命中主路径上自检**永不运行**（评审 t29 R1④ 的原话）。
+        /// **本次跑不成（词表未就绪）时保持标志为 false**，留给下一次机会 ——
+        /// 绝不把「跳过」当成「通过」。
+        /// </summary>
+        private void RunAliasVerificationOnce(GameResLocator loc, string where)
+        {
+            if (_aliasSelfTestDone) return;
+            if (loc == null) return;
+            string v;
+            try { v = loc.VerifyAliasAgainstLocTable(); }
+            catch (Exception ex) { EvidenceLog("【R1④ 自检】补验异常（已忽略）：" + ex.GetType().Name); return; }
+            if (v == null) return;                 // 词表未就绪 ⇒ 这次没跑成，保留机会
+            _aliasSelfTestDone = true;
+            // 【2026-09-26 收尾轮】本方法**整体**是内部自检（R1④）：结论只服务于交付取证，
+            //   对玩家没有任何可操作含义 ⇒ 三条日志一律走 EvidenceLog，不再占用玩家日志栏。
+            EvidenceLog("【R1④ 自检】" + where + " —— " + v);
+            try { AliasPathConsistencySelfTest(); }
+            catch (Exception ex) { EvidenceLog("【R1④ 自检】一致性自检异常（已忽略）：" + ex.GetType().Name); }
+        }
+
+        /// <summary>
+        /// 【t34 · T2 修复】是否可以进行 UI 侧补建。
+        ///   判据从「**别名表**已就绪就跳过」改为「**词表**已就绪才跳过」：
+        ///   缓存命中路径下 `TryImportAliasTable` 成功会让 `AliasTableCount = 8697`，
+        ///   而 `_loc` **没有词表** ⇒ 原判据一票否决补建 ⇒ 词表永不建立 ⇒
+        ///   ① `VerifyAliasAgainstLocTable` 永远返回 null（自检拿不到"通过"）、
+        ///   ② `SelfHealNameTableFromAlias` 永不执行、③ `LookupNameKeyWithAlias` 的内存词表分支
+        ///   在缓存命中会话里全程不可用 —— 即评审 t33 finding T2 的**死结**。
+        ///   另加两条必要约束：只在「名表来自缓存」的路径补建（冷启动 / 预热扫描不重复劳动），
+        ///   以及词表已就绪时立即返回（幂等）。
+        /// </summary>
+        private bool NeedLocAliasBackfill()
+        {
+            if (_loc == null) return false;
+            if (_locBackfillRunning) return false;
+            if (!_namesFromCache) return false;
+            if (_loc.LocalizedNameCount > 0) return false;   // 词表已就绪 ⇒ 无事可做
+            return true;
+        }
+
+        /// <summary>【R1①】后台补建 UI 侧词表 + 别名表；失败静默（不影响任何既有功能）。</summary>
+        private void StartLocAliasBackfill()
+        {
+            if (!NeedLocAliasBackfill()) return;
+            _locBackfillRunning = true;
+            try
+            {
+                System.Threading.Thread t = new System.Threading.Thread(
+                    new System.Threading.ThreadStart(LocAliasBackfillWorker));
+                t.IsBackground = true;
+                t.Start();
+            }
+            catch { _locBackfillRunning = false; }
+        }
+
+        private void LocAliasBackfillWorker()
+        {
+            try
+            {
+                GameResLocator loc = _loc;
+                if (loc == null) return;
+                // 【P1 · F-A 修复】记「本次别名表缓存**没能用上**」（文件缺失 / 被拒）。
+                //   为 true ⇒ 下面的 `PrefetchLocalizedNames` 必然走现场读取 ⇒ 读成功后
+                //   必须把表写回缓存；否则「只缺 .alias」或「.alias 被改坏」会被永久固化：
+                //   每次启动都拒缓存、退回现场读取（多付 ≈8 s 并每次打一条告警），
+                //   而**没有任何路径**能把它修回来。
+                bool aliasCacheMissed = false;
+                // 【t34 · T1】`_loc` 建立前无法 import ⇒ 别名表缓存在这里补上（毫秒级，不重扫）。
+                //   补 import 后词表建立只需 ≈4 s（`EnsureAliasIndex` 见表已就绪会早退）。
+                //   【2026-09-26 · P2】原先这里为了取「名表缓存头的 `alias=` 交叉基准」而**多读一次
+                //   名表缓存**；该字段与判据已取消 ⇒ 这次多余读取一并删除。
+                if (loc.AliasTableCount == 0 && _gameFingerprint != null && _gameFingerprint.Length > 0)
+                {
+                    List<string> af, at;
+                    string av, an;
+                    if (NameCacheStore.TryReadAlias(_gameFingerprint, out af, out at, out av, out an))
+                    {
+                        string inote;
+                        if (loc.TryImportAliasTable(af, at, out inote))
+                        {
+                            EvidenceLog("别名表 " + inote + "（缓存命中后台补 import；缓存来源验证="
+                                + (av == null || av.Length == 0 ? "未标注" : av) + "）");
+                        }
+                        else
+                        {
+                            // 【2026-09-26 · P2 可观测性补齐】原实现**只有成功分支打日志**，失败分支
+                            //   完全静默 ⇒「`.alias` 内容级损坏（行数与 count 都自洽、但 >10% 非法
+                            //   标识符）」在界面上不可见，只能靠旁证反推（P1 §4.4 的现场教训）。
+                            //   这里只补**一条日志**，拒绝理由直接取自既有 `inote`，不新增任何机制。
+                            //   ⚠ 如实登记：该场景**仍然不自愈** —— 导入失败会置 `_aliasIndexFailed`，
+                            //   `EnsureAliasIndex` 首行早退 ⇒ 现场重建被挡 ⇒ 下面的写回块前置条件
+                            //   （`loc.IsAliasTableReady`）不成立。这是 P1 §5.2 已登记的残余退化路径，
+                            //   本轮按「如非必要勿增实体」不修（修它要新增清标志+重试控制流）。
+                            EvidenceLog("别名表缓存内容校验未过（" + inote + "），本次退回现场读取。");
+                        }
+                    }
+                    else
+                    {
+                        aliasCacheMissed = true;
+                        EvidenceLog("别名表缓存后台补 import 未采用（" + an + "），本次退回现场读取。");
+                    }
+                }
+                // 词表建立（内部：词表就绪后并列建立运行时别名表 + 四重验证；表已就绪则早退）
+                loc.PrefetchLocalizedNames(new List<string>());
+                if (loc.LocalizedNameCount <= 0) return;
+                // 【P1 · F-A 修复】现场读取**成功**后补写回 `.alias`。
+                //   修复前：全产品唯一写 `.alias` 的路径是 `WarmupWorker` 的**冷启动全量扫描**
+                //   分支（见该方法内 `TryWriteAlias` 调用），而缓存命中路径永不进入它
+                //   ⇒ 只剩 `.alias` 缺失时，现场读到的表只留在内存，重启即丢（实测 55 s 后仍缺失）。
+                //   此处**复用既有通路**：数据来自 `TryExportAliasTable`（与冷启动同源），
+                //   写盘走 `NameCacheStore.TryWriteAlias`（含格式/条数/体量全部既有守卫），
+                //   不新增缓存层、不新增校验层、不新增标志位。
+                //   `verifiedAgainstLoc = true`：此处词表已就绪（上面刚判过），且建表时本身就
+                //   带着词表做过 ③④ 交叉验证 —— 与冷启动路径的传参口径一致。
+                if (aliasCacheMissed && loc.IsAliasTableReady)
+                {
+                    List<string> wFrom, wTo;
+                    if (loc.TryExportAliasTable(out wFrom, out wTo))
+                    {
+                        string wNote;
+                        if (NameCacheStore.TryWriteAlias(_gameFingerprint, wFrom, wTo, true, out wNote))
+                            EvidenceLog("别名表现场读取成功，已补写回缓存（" + wFrom.Count + " 行）。");
+                        else
+                            EvidenceLog("别名表补写回缓存未成功：" + wNote);
+                    }
+                }
+                SelfHealNameTableFromAlias(loc);
+                // 【t29 返工 · R1④ 解耦】补建完成后词表已就绪 ⇒ 这里是「别名表 vs 词表」补验
+                //   真正能跑成的地方（缓存命中路径的 import 之后也会调一次，谁先跑成算谁）。
+                RunAliasVerificationOnce(loc, "缓存命中后台补建后");
+            }
+            catch (Exception ex)
+            {
+                _lastErrorNote = ex.GetType().Name;
+                SaveErrorNote();
+            }
+            finally { _locBackfillRunning = false; }
+        }
+
+        /// <summary>
+        /// 【R1③】自愈：把「名表缺失 / 但别名链能解析出中文名」的条目补进会话名表并重写名表缓存。
+        ///   id 全集取自已装入的类型表（全库 814 条），中文名来自别名链 + 内存词表 ⇒ 无需重扫内存。
+        /// </summary>
+        private void SelfHealNameTableFromAlias(GameResLocator loc)
+        {
+            if (loc == null || !loc.IsAliasTableReady) return;
+            List<string> ids = new List<string>();
+            lock (_nameGate)
+            {
+                foreach (KeyValuePair<string, int> kv in _itemType)
+                    if (kv.Key != null && kv.Key.Length > 0) ids.Add(kv.Key);
+            }
+            if (ids.Count == 0) return;
+
+            Dictionary<string, string> healed = new Dictionary<string, string>();
+            for (int i = 0; i < ids.Count; i++)
+            {
+                string id = ids[i];
+                if (LookupNameKey(id) != null) continue;              // 名表已有 ⇒ 保持既有值不动
+                string zh = loc.ResolveLocalizedWithAlias(id);        // 别名优先 + 跟链到不动点 + 查词表
+                if (zh != null && zh.Length > 0) healed[id] = zh;
+            }
+            if (healed.Count == 0) return;
+
+            LoadNamesIntoTable(healed);
+            string fp = _gameFingerprint;
+            if (fp != null && fp.Length > 0)
+            {
+                string note;
+                // 【t29 返工】重写名表缓存时必须带上**本次别名表条数**：写 0 会让下次启动
+                //   拒绝这份缓存并强制重建（自愈）—— 这正是 R1-2 要的语义。
+                // 【t34 · U1 修复】这里必须用**行数**（`AliasTableRowCount`），不能用去重键数
+                //   （`AliasTableCount`）：名表缓存头的 `alias=` 与 `.alias` 的 `count` 都记行数，
+                //   传去重键数会让两侧恒差 12（8709 vs 8697）⇒ 自愈写缓存之后每次启动
+                //   都被 F4 的条数交叉判据误拒、退回现场全量重建（≈17 s）。
+                // 【2026-09-26 · P2】以上两段所描述的口径与判据**已随 `alias=` 字段一并取消**：
+                //   `TryWrite` 不再有形参，自愈写缓存与本路径其余写盘完全同口径，
+                //   「行数 vs 去重键数」的混用风险从根上消失（U1 事故类别不再可能复发）。
+                NameCacheStore.TryWrite(fp, SnapshotNameTable(), out note);   // 写失败不影响本会话
+            }
+            EvidenceLog("已用别名链补齐名表缺条 " + healed.Count + " 条（名表缓存已自愈）。");
+        }
+
+        /// <summary>会话名表的只读快照（用于自愈后重写名表缓存）。</summary>
+        private Dictionary<string, string> SnapshotNameTable()
+        {
+            Dictionary<string, string> snap = new Dictionary<string, string>();
+            lock (_nameGate)
+            {
+                foreach (KeyValuePair<string, ItemEntry> kv in _itemNames)
+                {
+                    ItemEntry e = kv.Value;
+                    if (e == null || e.Zh == null || e.Zh.Length == 0) continue;
+                    snap[kv.Key] = e.Zh;
+                }
+            }
+            return snap;
+        }
+
+        /// <summary>
+        /// 【R1④】两条路径一致性自检：抽样比较「名表直查」（缓存命中路径的取值口径）与
+        ///   「别名链解析」（别名表路径的口径）。判据：两者**不得冲突**；别名链能补上名表缺条。
+        ///   默认运行一次（毫秒级），结果上屏一条。
+        /// </summary>
+        private void AliasPathConsistencySelfTest()
+        {
+            string[] probes = new string[] {
+                "cabbage:1", "cabbage:2", "cabbage:3",
+                "surgeon_mistake_bones", "surgeon_mistake_brain", "surgeon_mistake_guts",
+                "surgeon_mistake_skin", "surgeon_mistake_skull", "surgeon_mistake_heart",
+                "prayer_base:1", "fertilizer:farming_5", "bones_1_1:2"
+            };
+            int agree = 0, aliasOnly = 0, missing = 0, diverge = 0;
+            string diffs = "";
+            for (int i = 0; i < probes.Length; i++)
+            {
+                string id = probes[i];
+                string viaTable = LookupNameKey(id);
+                string viaAlias = LookupNameKeyWithAlias(id);
+                if (viaAlias == null) { missing++; continue; }
+                if (viaTable == null) { aliasOnly++; continue; }
+                if (viaTable != viaAlias)
+                {
+                    diverge++;
+                    if (diffs.Length < 200)
+                        diffs += (diffs.Length > 0 ? "; " : "") + id + "=表:" + viaTable + "/链:" + viaAlias;
+                    continue;
+                }
+                agree++;
+            }
+            // 【t34 · T2】加「有效样本数 > 0」下限判据：原实现只要求 divege == 0，
+            //   12 条样本**全空**（agree + aliasOnly == 0）也会 PASS —— 那是"没测到"，不是"通过"（t33 finding T2）。
+            int valid = agree + aliasOnly;
+            bool ok = (diverge == 0) && (valid > 0);
+            // 【2026-09-26 收尾轮】本方法整体是**内部一致性自检**（方案A 取证），玩家无从据其行动
+            //   ⇒ 走 EvidenceLog：默认不上屏，需要时开 GK2TRAINER_EVIDENCE=1 复现。
+            EvidenceLog("【方案A 一致性自检】抽样 " + probes.Length + " 条：一致 " + agree
+                + " / 仅别名链可得 " + aliasOnly + " / 两路皆无 " + missing + " / 冲突 " + diverge
+                + "；有效样本 " + valid + "/" + probes.Length
+                + (ok ? " ⇒ PASS"
+                      : (diverge != 0 ? (" ⇒ FAIL（存在冲突）：" + diffs)
+                                      : " ⇒ FAIL（有效样本为 0：本次没测到，不算通过）")));
+        }
+
         /// <summary>英文物品 ID → 显示名：物品名表（游戏运行时提取）优先，查不到时退回 ID。
-        /// 表中查找不触发任何扫描，故可安全用于 UI 线程。</summary>
+        /// 表中查找不触发任何扫描，故可安全用于 UI 线程。
+        /// 【方案A 2026-09-26】取名顺序改为**对齐游戏规则**：
+        ///   ① 原名直查（会话名表 → 内存词表）—— 保持既有行为，命中结果与接入前逐字相同；
+        ///   ② 别名表跟链后查（游戏 `LLBase.L()`：别名优先、命中即跟链到不动点）；
+        ///   ③ `id.Split(':')[0]` 一级（游戏 `ItemDef.GetHeader()` 的 Star 回退，规则本身就有）。
+        /// 【2026-09-26 · P3 删除】原 ④ 级是本工具**自创**的 `head` / `head+"_1_1"` 两级启发式
+        ///   （比游戏规则多退一层：`bones_1_1:2` → `bones`）。已整段删除 —— 到此为止的链路与
+        ///   游戏一致，三级都落空即返回原始 id，不再猜测。
+        /// </summary>
         private string DisplayName(string id)
         {
+            if (id == null) return "?";
+
+            // ①② 原名 / 别名链（游戏规则）
+            string n = LookupNameKeyWithAlias(id);
+            if (n != null && n.Length > 0)
+            {
+                // 【P2 修复 2026-09-26】精确命中的星级物品也要标注星级，否则与走回退链的同族
+                // 变体显示不一致：例如 cabbage:1 精确命中「卷心菜」不加标注，而 cabbage:2 走
+                // 别名回退却显示「卷心菜（银星）」。
+                // 【2026-09-26 统一后缀】改为调用 ItemSuffix：星级与红白骷髅都在这里拼，
+                // 两者都可缺省（红白均 0 ⇒ 不显示红白；后缀非数字 ⇒ 不显示星级）。
+                return n + ItemSuffix(id);
+            }
+
+            int colon = id.IndexOf(':');
+            if (colon > 0 && colon + 1 < id.Length)
+            {
+                string baseId = id.Substring(0, colon);
+
+                // ③ 游戏规则本身的一级回退：基名（同样先走别名链，只增不减命中）
+                string cand = LookupNameKeyWithAlias(baseId);
+                if (cand != null && cand.Length > 0) return cand + ItemSuffix(id);
+            }
+            return id;
+        }
+
+        /// <summary>
+        /// 【方案A】带别名表的候选键取名：原名直查（会话名表 → 内存词表）→ 别名链 → 链尾查会话名表。
+        /// 顺序刻意保持「原名直查优先」：会话名表里已装入精确 id 与候选键，直查命中时结果与
+        /// **接入前逐字相同**（回归安全），别名链只在直查落空时介入。
+        /// 全程不触发任何内存扫描（<see cref="GameResLocator.ResolveLocalizedWithAlias"/> /
+        /// <see cref="GameResLocator.ResolveAliasChain"/> 只查已建立的索引）⇒ 可安全用于 UI 线程。
+        /// </summary>
+        private string LookupNameKeyWithAlias(string key)
+        {
+            if (key == null || key.Length == 0) return null;
+
+            // ① 原名直查（既有两条来源、既有顺序）
+            string direct = LookupNameKey(key);
+            if (direct != null && direct.Length > 0) return direct;
+
+            if (_loc == null) return null;
+
+            // ② 游戏规则：别名优先 —— 跟链到不动点后查内存中文词表
+            string via = _loc.ResolveLocalizedWithAlias(key);
+            if (via != null && via.Length > 0) return via;
+
+            // ③ 链尾也查会话名表（名表内含候选键，与内存词表共用同一套候选键口径）
+            string chain = _loc.ResolveAliasChain(key);
+            if (chain != null && chain.Length > 0 && chain != key)
+            {
+                ItemEntry e;
+                if (NameTableLookup(chain, out e) && e.Zh != null && e.Zh.Length > 0) return e.Zh;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 按一个候选键取中文名：先查会话名表，再查定位器的内存词表；都没有返回 null。
+        /// 两条来源共用同一套候选键，避免只补其中一条导致行为不一致。
+        /// </summary>
+        private string LookupNameKey(string key)
+        {
+            if (key == null || key.Length == 0) return null;
             ItemEntry e;
-            if (id != null && NameTableLookup(id, out e))
+            if (NameTableLookup(key, out e))
             {
                 if (e.Zh != null && e.Zh.Length > 0) return e.Zh;
             }
-            if (id != null && _loc != null)
+            if (_loc != null)
             {
                 string mem;
-                if (_loc.TryGetLocalizedName(id, out mem) && mem.Length > 0) return mem;
+                if (_loc.TryGetLocalizedName(key, out mem) && mem.Length > 0) return mem;
             }
-            return id == null ? "?" : id;
+            return null;
         }
 
-        /// <summary>取当前下拉选中项对应的英文物品 ID（下拉显示中文，内部始终用 ID）。</summary>
-        private string GetItemIdFromUi()
+        /// <summary>
+        /// 星级后缀（**本工具自己的标注用词**）。
+        /// 数据的依据：`ItemDef.quality` 等于 id 里 ":N" 后缀的值，1/2/3 的三级阶梯有游戏数据佐证
+        /// （169 个 qualityType=Star 的物品全部带 ":N"，且 0 例后缀 ≠ quality；
+        ///  证据 `02_分析记录\_星级与读档机制_20260926\evidence\itemdef_full.csv`）。
+        /// **须与游戏文案区分**（t5 评审 F5）：游戏界面并不出现「铜星/银星/金星」字样，
+        /// 它用的是 `icon-quality-*` 图标与「青铜/白银」一类文案 —— 此处的三词是本修改器
+        /// 为便于区分同名变体而加的**自有标注**，不是游戏原文。
+        /// 未知或异常值（如 `fertilizer:peat` 这类非数字后缀）一律返回空串 —— 不猜测。
+        /// </summary>
+        private static string StarSuffix(string quality)
         {
-            // 【T8-F3 处置】原实现末尾有一个「从自由文本里抠 (itemId)」的兜底分支
-            //（ParseItemIdText）：`_cmbItemId.DropDownStyle = DropDownList` 之后，
-            // 玩家无法手打文本、未选中时 Text 为空 → 该分支**实际不可达**，已整体删除；
-            // 这里退化为「返回选中项显示文本」，与原兜底在不可达前提下的行为等价。
-            string t = _cmbItemId.Text;
-            if (t == null) t = "";
-            t = t.Trim();
-            InvEntry sel = _cmbItemId.SelectedItem as InvEntry;
-            if (sel != null && (t.Length == 0 || t == sel.ToString())) return sel.Id;
-            return t;
+            if (quality == "1") return "（铜星）";
+            if (quality == "2") return "（银星）";
+            if (quality == "3") return "（金星）";
+            return "";
         }
+
+        /// <summary>
+        /// 红白骷髅文本（不含括号），取值来自 ItemDef **运行时字段**（+0xF4 / +0xF8），
+        /// **不是**解析 id —— `guts_2_2:2` 的 id 段写 `_2_2` 而字段实为红1白1（814 条中唯一反例），
+        /// 该物品在标定样本内且于新偏移上吻合。
+        /// 规则（用户 2026-09-26 裁决）：
+        ///   · 红白**均为 0** ⇒ 返回空串（不显示，避免满屏「红0白0」）；
+        ///   · 否则返回「红X白Y」，**负值按数值显示**以保证一致性
+        ///     （用户原话：「移除红1还是标成红-1保证一致性吧」）——
+        ///     例：embalm_white_red:1（红-1白1）⇒「红-1白1」；surgeon_mistake_skin（红-1白-1）⇒「红-1白-1」。
+        /// </summary>
+        private string SkullText(string id)
+        {
+            if (id == null || id.Length == 0) return "";
+            int[] v;
+            lock (_nameGate) { _itemAttrs.TryGetValue(id, out v); }
+            if (v == null || v.Length < 2) return "";
+            if (v[0] == 0 && v[1] == 0) return "";
+            return "红" + v[0] + "白" + v[1];
+        }
+
+        /// <summary>
+        /// 物品显示名的后缀「（星级，红X白Y）」——两部分各自可缺省，都缺省时返回空串。
+        /// 例：`bones_1_1:2` ⇒「（银星，红1白1）」；`bones_0_0:1` ⇒「（铜星）」；
+        ///     `surgeon_mistake_skin`（无星级、红-1白-1）⇒「（红-1白-1）」。
+        /// </summary>
+        private string ItemSuffix(string id)
+        {
+            if (id == null || id.Length == 0) return "";
+            string star = "";
+            int c = id.IndexOf(':');
+            if (c > 0 && c + 1 < id.Length) star = StarSuffix(id.Substring(c + 1));   // 含括号，或空串
+            string skull = SkullText(id);
+            if (star.Length == 0 && skull.Length == 0) return "";
+            if (star.Length == 0) return "（" + skull + "）";
+            if (skull.Length == 0) return star;
+            // star 形如「（铜星）」→ 去掉收尾括号后与红白合并
+            return star.Substring(0, star.Length - 1) + "，" + skull + "）";
+        }
+
+        // 【2026-09-26 删除】此处原有 `GetItemIdFromUi()`（返回下拉选中项的英文 id）。
+        //   删除理由：两条写入路径（数量「应用」、一次性写入）改为**按地址**取对象后，
+        //   它已**无任何调用点**（全仓计数 0）；且它的返回值只用于「按 id 查对象」这一
+        //   已被判定为缺陷的做法。职责由 `<see cref="FindInvItemByAddr"/>` 承接。
+        //   ⚠ 按项目既有约定不写出被删方法名之外的死代码检索词。
 
         /// <summary>
         /// 一次性写入：把背包中选中物品的数量改成框内填写的值（不锁定）。
@@ -1888,8 +3930,9 @@ namespace GK2Trainer
                 // 【硬约束③·等待态零写入】未就绪绝不写内存（与 OnApplyOnceClick 同一道防线）
                 if (!CanWrite()) { Log("游戏数据尚未就绪，请稍候或点「刷新」。"); return; }
 
-                string id = GetItemIdFromUi();
-                GameResLocator.ItemRef r = FindInvItem(id);
+                // 【必修缺陷修复 2026-09-26】不再按 id 查（同 id 多件会取错对象），改用下拉项自带地址
+                InvEntry sel = _cmbItemId.SelectedItem as InvEntry;
+                GameResLocator.ItemRef r = FindInvItemByAddr(sel != null ? sel.Address : 0);
                 if (r == null)
                 {
                     Log("这个物品目前不在背包里，请点「刷新」后重新选择。");
@@ -1939,7 +3982,7 @@ namespace GK2Trainer
         //   · 主监控 1 s 一次，只做进程存在性检查（FindGamePid），**零内存扫描**；
         //   · 无进程时不做任何扫描，CPU 保持低位；
         //   · 未就绪时退避重试（3→6→…→30 s 封顶），不是每轮都扫全堆；
-        //   · 就绪后只走微秒级 IsAnchorStillValid()，不重复全堆扫描。
+        //   · 就绪后只走微秒级 IsSameSaveSlot()（身份引用，1 次内存读），不重复全堆扫描。
         //
         // 安全不变式：NO_PROCESS / NOT_READY 下**不写内存**、**不用启发式兜底选组**；
         //   进程消失时立刻清空所有「已定位地址」绑定数据，避免拿旧地址写入新进程。
@@ -1992,17 +4035,15 @@ namespace GK2Trainer
             return _lifeState == LC_READY && _groupSelected && _loc != null && _mem.IsOpen;
         }
 
-        /// <summary>状态迁移统一入口：改状态 + 同步界面可用性，避免多处漏调用导致「按钮可点但不可写」。</summary>
-        private void SetLifeState(int s)
-        {
-            _lifeState = s;
-            RefreshFeatureAvailability();
-        }
-
         /// <summary>
+        /// 【审核轮 2026-09-26 · 已删除 SetLifeState】原「状态迁移统一入口」全文件零调用
+        /// （20+ 处均为直接 `_lifeState = ...` 赋值），声明的纪律从未被执行；
+        /// 反向启用它会改变行为（每次迁移都触发 RefreshFeatureAvailability），故删而不启。
+        /// </summary>
+        /// <remarks>
         /// 清空全部「与某个已定位存档绑定」的运行时数据。
         /// 进程消失 / 换进程时必须先清，否则旧地址会被用于新进程（误写风险）。
-        /// </summary>
+        /// </remarks>
         private void ClearAnchoredData()
         {
             _res = new Dictionary<string, GameResAtom>();
@@ -2069,12 +4110,18 @@ namespace GK2Trainer
                 return;
             }
 
-            // ②′ 进程未变但存档锚已失效（读档 / 回主菜单）→ 全部回落「等待游戏开始」并自动重定位。
+            // ②′ 进程未变但**身份引用**已失效（真读档 / 回主菜单）→ 全部回落「等待游戏开始」并自动重定位。
+            // 【P0a 2026-09-26】判据改用 IsSameSaveSlot()：只认「静态槽不再指向缓存的 PlayerData」
+            // 这一个决定性信号（外加 gameState 闸）。旧实现用 IsAnchorStillValid()（= 身份 ∧ **结构可读**），
+            // 把「背包被清空（容器 size == 0）」这类**合法结构状态**也判成换档 ⇒ 清空重载；
+            // 实测误判持续 57.8 s（527/4546 采样点 containerOk=0 而 slotOk=1、inGame=1）。
+            // 结构不可读**不再**进入本分支：后果 = 不降态、不清数据、不重载；下一次热路径
+            // 廉价校验（FindPlayerInventory / LocateWorker 分流）失败时走既有冷路径**重新解析一次**。
             // 【2026-09-24 恢复】此分支缺失导致读档后各缓存地址继续读旧档对象（§2.4:旧对象不释放）,
-            // 显示旧数据直到手动点刷新。IsAnchorStillValid 仅数次内存读,每秒一次开销可忽略。
+            // 显示旧数据直到手动点刷新。判据仅数次内存读,每秒一次开销可忽略。
             // 【t3 A-1】条件严格限定 LC_READY：真失败态（LC_FAILED）不得进入本分支，
             // 否则「清零重试计数 → 立即重启」会把 NOT_READY_MAX_RETRIES 完全抵消。
-            if (_lifeState == LC_READY && _loc != null && (!_loc.IsAnchorStillValid() || !_loc.IsInGameSession()))
+            if (_lifeState == LC_READY && _loc != null && (!_loc.IsSameSaveSlot() || !_loc.IsInGameSession()))
             {
                 _lifeState = LC_NOT_READY;
                 _notReadyRetries = 0;
@@ -2258,7 +4305,11 @@ namespace GK2Trainer
                     if (!_scanBusy && canWrite && ++_sciRecheckCounter >= _sciRecheckInterval)
                     {
                         _sciRecheckCounter = 0;
-                        StartSciRecheck(f.ItemId);
+                        // 【P5 · 2026-09-26】与冷路径同一约定（见 LocateWorker 内的「bool inBag」守卫）:
+                        //   **背包里已有该物品 ⇒ 不做世界链定位**。因为下一行 ia 优先取 LookupBagCache，
+                        //   命中时 _sciItemAddr 根本不会被读取 ⇒ 那次世界链遍历没有消费者，是纯浪费。
+                        //   仅当背包缓存未命中（science 在研究台等 WGO 容器里）才派发后台重定位。
+                        if (LookupBagCache(f.ItemId) == 0) StartSciRecheck(f.ItemId);
                     }
                     long ia = LookupBagCache(f.ItemId);
                     if (ia == 0) ia = System.Threading.Volatile.Read(ref _sciItemAddr);
@@ -2380,8 +4431,9 @@ namespace GK2Trainer
                     resLocked.Add(f.ResKey);
                 }
 
-                string id = GetItemIdFromUi();
-                GameResLocator.ItemRef r = FindInvItem(id);
+                // 【必修缺陷修复 2026-09-26】同上：按地址取对象，不按 id
+                InvEntry sel2 = _cmbItemId.SelectedItem as InvEntry;
+                GameResLocator.ItemRef r = FindInvItemByAddr(sel2 != null ? sel2.Address : 0);
                 int targetCount;
                 if (r != null && int.TryParse(_txtItemLock.Text.Trim(), out targetCount))
                 {

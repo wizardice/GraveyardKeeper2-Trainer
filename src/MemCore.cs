@@ -365,41 +365,45 @@ namespace GK2Trainer
 
             int n = targets.Count;
             List<long>[] parts = new List<long>[n];
-            // 【P0-①】线程本地复用缓冲：分配从 4.03 GB/次 降到「线程数 × 4 MB」
-            System.Threading.ThreadLocal<byte[]> tl =
-                new System.Threading.ThreadLocal<byte[]>(delegate { return new byte[SCAN_CHUNK]; });
-            System.Threading.Tasks.Parallel.For(0, n, delegate(int ri)
+            // 【P0-①】线程本地复用缓冲：分配从 4.03 GB/次 降到「线程数 × 4 MB」。
+            // 【审核轮 2026-09-26】缓冲是 LOH 大对象，扫描结束应立即归还（Dispose），
+            //   否则要等下一次完整 GC 才回收 —— 这是历史实测「工作集 178 MB vs 旧版 52~67 MB」的成因之一。
+            using (System.Threading.ThreadLocal<byte[]> tl =
+                new System.Threading.ThreadLocal<byte[]>(delegate { return new byte[SCAN_CHUNK]; }))
             {
-                MemRegion r = targets[ri];
-                List<long> local = new List<long>();
-                byte first = needle[0];
-                byte[] buf = tl.Value;
-                long off = 0;
-                while (off < r.Size)
+                System.Threading.Tasks.Parallel.For(0, n, delegate(int ri)
                 {
-                    int chunk = (int)Math.Min((long)SCAN_CHUNK, r.Size - off);
-                    int got = ReadInto(r.Base + off, buf, chunk);
-                    if (got >= needle.Length)
+                    MemRegion r = targets[ri];
+                    List<long> local = new List<long>();
+                    byte first = needle[0];
+                    byte[] buf = tl.Value;
+                    long off = 0;
+                    while (off < r.Size)
                     {
-                        int limit = got - needle.Length;
-                        int idx = 0;
-                        while (idx <= limit)
+                        int chunk = (int)Math.Min((long)SCAN_CHUNK, r.Size - off);
+                        int got = ReadInto(r.Base + off, buf, chunk);
+                        if (got >= needle.Length)
                         {
-                            int hit = Array.IndexOf<byte>(buf, first, idx, limit - idx + 1);
-                            if (hit < 0) break;
-                            bool ok = true;
-                            for (int k = 1; k < needle.Length; k++)
+                            int limit = got - needle.Length;
+                            int idx = 0;
+                            while (idx <= limit)
                             {
-                                if (buf[hit + k] != needle[k]) { ok = false; break; }
+                                int hit = Array.IndexOf<byte>(buf, first, idx, limit - idx + 1);
+                                if (hit < 0) break;
+                                bool ok = true;
+                                for (int k = 1; k < needle.Length; k++)
+                                {
+                                    if (buf[hit + k] != needle[k]) { ok = false; break; }
+                                }
+                                if (ok) local.Add(r.Base + off + hit);
+                                idx = hit + 1;
                             }
-                            if (ok) local.Add(r.Base + off + hit);
-                            idx = hit + 1;
                         }
+                        off += chunk;
                     }
-                    off += chunk;
-                }
-                parts[ri] = local;
-            });
+                    parts[ri] = local;
+                });
+            }
 
             for (int i = 0; i < n; i++)
             {
@@ -462,39 +466,42 @@ namespace GK2Trainer
 
             int n = scan.Count;
             List<long>[] parts = new List<long>[n];
-            System.Threading.ThreadLocal<byte[]> tl =
-                new System.Threading.ThreadLocal<byte[]>(delegate { return new byte[SCAN_CHUNK]; });
-            System.Threading.Tasks.Parallel.For(0, n, delegate(int ri)
+            // 【审核轮 2026-09-26】同 ScanParallel：LOH 缓冲扫描结束立即归还。
+            using (System.Threading.ThreadLocal<byte[]> tl =
+                new System.Threading.ThreadLocal<byte[]>(delegate { return new byte[SCAN_CHUNK]; }))
             {
-                MemRegion r = scan[ri];
-                List<long> local = new List<long>();
-                byte[] buf = tl.Value;
-                long off = 0;
-                while (off < r.Size)
+                System.Threading.Tasks.Parallel.For(0, n, delegate(int ri)
                 {
-                    int chunk = (int)Math.Min((long)SCAN_CHUNK, r.Size - off);
-                    int got = ReadInto(r.Base + off, buf, chunk);
-                    if (got >= 8)
+                    MemRegion r = scan[ri];
+                    List<long> local = new List<long>();
+                    byte[] buf = tl.Value;
+                    long off = 0;
+                    while (off < r.Size)
                     {
-                        int limit = got - 8;
-                        if (single >= 0)
+                        int chunk = (int)Math.Min((long)SCAN_CHUNK, r.Size - off);
+                        int got = ReadInto(r.Base + off, buf, chunk);
+                        if (got >= 8)
                         {
-                            for (int i = 0; i <= limit; i += 8)
-                                if (BitConverter.ToInt64(buf, i) == single) local.Add(r.Base + off + i);
-                        }
-                        else
-                        {
-                            for (int i = 0; i <= limit; i += 8)
+                            int limit = got - 8;
+                            if (single >= 0)
                             {
-                                long v = BitConverter.ToInt64(buf, i);
-                                if (set.Contains(v)) local.Add(r.Base + off + i);
+                                for (int i = 0; i <= limit; i += 8)
+                                    if (BitConverter.ToInt64(buf, i) == single) local.Add(r.Base + off + i);
+                            }
+                            else
+                            {
+                                for (int i = 0; i <= limit; i += 8)
+                                {
+                                    long v = BitConverter.ToInt64(buf, i);
+                                    if (set.Contains(v)) local.Add(r.Base + off + i);
+                                }
                             }
                         }
+                        off += chunk;
                     }
-                    off += chunk;
-                }
-                parts[ri] = local;
-            });
+                    parts[ri] = local;
+                });
+            }
 
             for (int i = 0; i < n; i++)
             {
