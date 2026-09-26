@@ -423,7 +423,7 @@ namespace GK2Trainer
             catch { }
 
             // 版本号：与 GitHub Release tag 一一对应（v1.1.0 = 2026-09-26：物品种类修改 + 别名表汉化 + 缓存/UI 修复）
-            Text = "守墓人2 修改器  v1.1.0   [By:东皇钟]";
+            Text = "守墓人2 修改器  v1.1.1   [By:东皇钟]";
 
             // 【t24 修复 · 窗口被放大导致右下留白】
             // AutoScaleMode = Font 时，OnLoad 会按 AutoScaleFactor = 当前字体度量 / 设计基准
